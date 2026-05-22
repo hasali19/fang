@@ -1,13 +1,26 @@
+#![feature(try_blocks)]
+
+mod udev;
+
 use anyhow::anyhow;
+use futures::StreamExt;
 use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, thread};
-use zbus::zvariant::Type;
+use tracing::{error, info};
+use uuid::Uuid;
+use zbus::zvariant::{OwnedObjectPath, Type};
 use zbus::{connection, interface};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+use crate::udev::{DeviceAction, DeviceMonitor};
 
 const RAZER_VID: u16 = 0x1532;
 const RAZER_MOUSE_DOCK_PRO_PID: u16 = 0x00a4;
@@ -15,33 +28,13 @@ const RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID: u16 = 0xcd;
 
 const RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID: u8 = 0xe0;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let api = HidApi::new()?;
 
-    let device_info = api
-        .device_list()
-        .find(|d| {
-            d.vendor_id() == RAZER_VID
-                && d.product_id() == RAZER_MOUSE_DOCK_PRO_PID
-                && d.interface_number() == 0
-        })
-        .ok_or_else(|| anyhow!("Failed to find device"))?;
-
-    let device = Arc::new(Mutex::new(device_info.open_device(&api)?));
-
-    let mut dock = MouseDock::new(device.clone());
-
-    let paired_devices = dock.get_paired_devices()?;
-    for (status, pid) in &paired_devices {
-        tracing::info!(
-            pid = format!("0x{pid:x}"),
-            connected = *status == 1,
-            "Discovered device"
-        );
-    }
+    let monitor = DeviceMonitor::new(RAZER_VID)?;
 
     let use_session_bus = env::args().any(|arg| arg == "--session");
 
@@ -51,28 +44,103 @@ async fn main() -> anyhow::Result<()> {
         connection::Builder::system()?
     };
 
-    let mut builder = builder.name("dev.hasali.fang")?;
+    let conn = builder.name("dev.hasali.fang")?.build().await?;
 
-    for (i, (_, pid)) in paired_devices.iter().enumerate() {
-        if *pid != RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID {
-            continue;
-        }
+    info!(
+        "Service 'dev.hasali.fang' is listening on dbus {} bus",
+        if use_session_bus { "session" } else { "system" }
+    );
 
-        let service = RazerMouseService {
-            mouse: Mutex::new(Mouse::new(
-                device.clone(),
-                RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
-            )),
+    // Maps a device syspath to one or more dbus object paths
+    let mut device_map: HashMap<PathBuf, Vec<OwnedObjectPath>> = HashMap::new();
+
+    let mut monitor_events = monitor.monitor_events();
+    while let Some(event) = monitor_events.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => {
+                error!("{e}");
+                continue;
+            }
         };
 
-        builder = builder.serve_at(format!("/dev/hasali/fang/{i}"), service)?;
+        match event.action {
+            DeviceAction::Add => {
+                if event.device.product_id != RAZER_MOUSE_DOCK_PRO_PID
+                    || event.device.interface_number != 0
+                {
+                    continue;
+                }
+
+                info!(
+                    syspath = %event.device.syspath.display(),
+                    "Device connected"
+                );
+
+                let devnode = CString::new(event.device.devnode.as_os_str().as_bytes())?;
+                let device = Arc::new(Mutex::new(api.open_path(&devnode)?));
+
+                let mut dock = MouseDock::new(device.clone());
+
+                let paired_devices = dock.get_paired_devices()?;
+
+                for (status, pid) in &paired_devices {
+                    info!(
+                        pid = format!("0x{pid:x}"),
+                        connected = *status == 1,
+                        "Discovered paired device"
+                    );
+                }
+
+                let object_paths = device_map.entry(event.device.syspath).or_default();
+
+                for (_, pid) in &paired_devices {
+                    if *pid != RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID {
+                        continue;
+                    }
+
+                    let uuid = Uuid::new_v4();
+                    let object_path =
+                        OwnedObjectPath::try_from(format!("/dev/hasali/fang/{}", uuid.simple()))?;
+
+                    let service = RazerMouseService {
+                        mouse: Mutex::new(Mouse::new(
+                            device.clone(),
+                            RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
+                        )),
+                    };
+
+                    conn.object_server().at(&object_path, service).await?;
+
+                    info!(path = %object_path, "Registered device");
+
+                    object_paths.push(object_path);
+                }
+            }
+            DeviceAction::Remove => {
+                let Some(paths) = device_map.remove(&event.device.syspath) else {
+                    continue;
+                };
+
+                info!(
+                    syspath = %event.device.syspath.display(),
+                    "Device disconnected"
+                );
+
+                for path in &paths {
+                    conn.object_server()
+                        .remove::<RazerMouseService, _>(path)
+                        .await?;
+
+                    info!(path = %path, "Unregistered device")
+                }
+            }
+        }
     }
 
-    let _conn = builder.build().await?;
+    tokio::signal::ctrl_c().await?;
 
-    tracing::info!("Service 'dev.hasali.fang' is listening on DBus session bus");
-
-    Ok(std::future::pending::<()>().await)
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Type)]
