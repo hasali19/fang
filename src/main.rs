@@ -1,16 +1,22 @@
 use anyhow::anyhow;
 use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
+use std::{env, thread};
+use zbus::zvariant::Type;
+use zbus::{connection, interface};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 const RAZER_VID: u16 = 0x1532;
 const RAZER_MOUSE_DOCK_PRO_PID: u16 = 0x00a4;
 const RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID: u16 = 0xcd;
 
-fn main() -> anyhow::Result<()> {
+const RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID: u8 = 0xe0;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let api = HidApi::new()?;
@@ -22,7 +28,7 @@ fn main() -> anyhow::Result<()> {
                 && d.product_id() == RAZER_MOUSE_DOCK_PRO_PID
                 && d.interface_number() == 0
         })
-        .ok_or_else(|| anyhow!("Failed to find mouse"))?;
+        .ok_or_else(|| anyhow!("Failed to find device"))?;
 
     let device = Arc::new(Mutex::new(device_info.open_device(&api)?));
 
@@ -30,26 +36,73 @@ fn main() -> anyhow::Result<()> {
 
     let paired_devices = dock.get_paired_devices()?;
     for (status, pid) in &paired_devices {
-        println!("---");
-        println!("pid: 0x{pid:x}");
-        println!("connected: {}", *status == 1);
-    }
-
-    if let Some((_, pid)) = paired_devices.first()
-        && *pid == RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID
-    {
-        let mut mouse = Mouse::new(device, 0xe0);
-
-        let battery_level = mouse.get_battery_level()?;
-        let charging_status = mouse.get_charging_status()?;
-        println!(
-            "battery: {:.00}%",
-            (f64::from(battery_level) / 255.0) * 100.0
+        tracing::info!(
+            pid = format!("0x{pid:x}"),
+            connected = *status == 1,
+            "Discovered device"
         );
-        println!("charging: {}", charging_status == 1);
     }
 
-    Ok(())
+    let use_session_bus = env::args().any(|arg| arg == "--session");
+
+    let builder = if use_session_bus {
+        connection::Builder::session()?
+    } else {
+        connection::Builder::system()?
+    };
+
+    let mut builder = builder.name("dev.hasali.fang")?;
+
+    for (i, (_, pid)) in paired_devices.iter().enumerate() {
+        if *pid != RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID {
+            continue;
+        }
+
+        let service = RazerMouseService {
+            mouse: Mutex::new(Mouse::new(
+                device.clone(),
+                RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
+            )),
+        };
+
+        builder = builder.serve_at(format!("/dev/hasali/fang/{i}"), service)?;
+    }
+
+    let _conn = builder.build().await?;
+
+    tracing::info!("Service 'dev.hasali.fang' is listening on DBus session bus");
+
+    Ok(std::future::pending::<()>().await)
+}
+
+#[derive(Debug, Serialize, Deserialize, Type)]
+struct BatteryStatus {
+    level: u8,
+    charging: bool,
+}
+
+struct RazerMouseService {
+    mouse: Mutex<Mouse>,
+}
+
+#[interface(name = "dev.hasali.fang.mouse")]
+impl RazerMouseService {
+    async fn get_battery_status(&self) -> zbus::fdo::Result<BatteryStatus> {
+        let mut mouse = self.mouse.lock();
+
+        let level = mouse
+            .get_battery_level()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let charging = mouse
+            .get_charging_status()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        Ok(BatteryStatus {
+            level,
+            charging: charging == 1,
+        })
+    }
 }
 
 struct MouseDock {
@@ -126,7 +179,7 @@ impl Mouse {
             self.next_transaction_id = self.base_transaction_id;
         }
 
-        Ok(r.data[1])
+        Ok((f64::from(r.data[1] as f64 / 255.0) * 100.0) as u8)
     }
 
     pub fn get_charging_status(&mut self) -> anyhow::Result<u8> {
