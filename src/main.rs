@@ -82,19 +82,17 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut dock = MouseDock::new(device.clone());
 
-                let paired_devices = dock.get_paired_devices()?;
+                let object_paths = device_map.entry(event.device.syspath).or_default();
 
-                for (status, pid) in &paired_devices {
+                let paired_device = dock.get_paired_device()?;
+
+                if let Some((status, pid)) = &paired_device {
                     info!(
                         pid = format!("0x{pid:x}"),
                         connected = *status == 1,
                         "Discovered paired device"
                     );
-                }
 
-                let object_paths = device_map.entry(event.device.syspath).or_default();
-
-                for (_, pid) in &paired_devices {
                     if *pid != RAZER_BASILISK_V3_PRO_35K_WIRELESS_PID {
                         continue;
                     }
@@ -188,7 +186,7 @@ impl MouseDock {
         }
     }
 
-    pub fn get_paired_devices(&mut self) -> anyhow::Result<Vec<(u8, u16)>> {
+    pub fn get_paired_device(&mut self) -> anyhow::Result<Option<(u8, u16)>> {
         let r = device_request(
             &self.device.lock(),
             0xe0 | self.next_transaction_id,
@@ -203,17 +201,13 @@ impl MouseDock {
             self.next_transaction_id = self.base_transaction_id;
         }
 
-        let mut devices = vec![];
-
-        for i in 0..r.data[0] as usize {
-            let status = r.data[i * 3 + 1];
-            let pid = u16::from_be_bytes([r.data[i * 3 + 2], r.data[i * 3 + 3]]);
-            if pid != 0xffff {
-                devices.push((status, pid));
-            }
+        let status = r.data[1];
+        let pid = u16::from_be_bytes([r.data[2], r.data[3]]);
+        if pid == 0xffff {
+            return Ok(None);
         }
 
-        Ok(devices)
+        Ok(Some((status, pid)))
     }
 }
 
