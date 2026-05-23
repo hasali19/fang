@@ -4,10 +4,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::Poll;
 
-use futures::{Stream, StreamExt};
+use async_fn_stream::try_fn_stream;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use udev::MonitorSocket;
 
 pub struct DeviceMonitor {
@@ -16,7 +15,7 @@ pub struct DeviceMonitor {
 }
 
 impl DeviceMonitor {
-    pub fn new(vendor_id: u16) -> anyhow::Result<DeviceMonitor> {
+    pub fn new(vendor_id: u16) -> eyre::Result<DeviceMonitor> {
         Ok(DeviceMonitor {
             vendor_id,
             socket: AsyncMonitorSocket::new(
@@ -27,40 +26,33 @@ impl DeviceMonitor {
         })
     }
 
-    pub fn monitor_events(mut self) -> impl Stream<Item = io::Result<DeviceEvent>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        tokio::task::spawn_local(async move {
+    pub fn events(mut self) -> impl Stream<Item = io::Result<DeviceEvent>> {
+        try_fn_stream(|emitter| async move {
             let mut devices = HashMap::new();
 
-            let res = try {
-                let mut enumerator = udev::Enumerator::new()?;
-                enumerator.match_subsystem("hidraw")?;
+            let mut enumerator = udev::Enumerator::new()?;
+            enumerator.match_subsystem("hidraw")?;
 
-                for device in enumerator.scan_devices()? {
-                    if let Some(device) = DeviceInfo::from_udev(&device, self.vendor_id) {
-                        devices.insert(device.syspath.clone(), device);
-                    }
+            for device in enumerator.scan_devices()? {
+                if let Some(device) = DeviceInfo::from_udev(&device, self.vendor_id) {
+                    devices.insert(device.hidraw_syspath.clone(), device);
                 }
-            };
-
-            for device in devices.values() {
-                let _ = tx.send(Ok(DeviceEvent {
-                    action: DeviceAction::Add,
-                    device: device.clone(),
-                }));
             }
 
-            if let Err(e) = res {
-                let _ = tx.send(Err(e));
-                return;
+            for device in devices.values() {
+                emitter
+                    .emit(DeviceEvent {
+                        action: DeviceAction::Add,
+                        device: device.clone(),
+                    })
+                    .await;
             }
 
             while let Some(event) = self.socket.next().await {
                 let event = match event {
                     Ok(event) => event,
                     Err(e) => {
-                        let _ = tx.send(Err(e));
+                        emitter.emit_err(e).await;
                         continue;
                     }
                 };
@@ -70,9 +62,7 @@ impl DeviceMonitor {
                     else {
                         continue;
                     };
-
-                    devices.insert(device.syspath.clone(), device.clone());
-
+                    devices.insert(device.hidraw_syspath.clone(), device.clone());
                     DeviceEvent {
                         action: DeviceAction::Add,
                         device,
@@ -81,7 +71,6 @@ impl DeviceMonitor {
                     let Some(device) = devices.remove(event.syspath()) else {
                         continue;
                     };
-
                     DeviceEvent {
                         action: DeviceAction::Remove,
                         device,
@@ -90,11 +79,11 @@ impl DeviceMonitor {
                     continue;
                 };
 
-                let _ = tx.send(Ok(event));
+                emitter.emit(event).await;
             }
-        });
 
-        UnboundedReceiverStream::new(rx)
+            Ok(())
+        })
     }
 }
 
@@ -110,7 +99,8 @@ pub struct DeviceEvent {
 
 #[derive(Clone)]
 pub struct DeviceInfo {
-    pub syspath: PathBuf,
+    pub hidraw_syspath: PathBuf,
+    pub usb_device_syspath: PathBuf,
     pub devnode: PathBuf,
     pub product_id: u16,
     pub interface_number: u8,
@@ -140,10 +130,9 @@ impl DeviceInfo {
             return None;
         }
 
-        let syspath = device.syspath().to_path_buf();
-
         Some(DeviceInfo {
-            syspath,
+            hidraw_syspath: device.syspath().to_path_buf(),
+            usb_device_syspath: usb_device.syspath().to_path_buf(),
             devnode,
             product_id: pid,
             interface_number,
