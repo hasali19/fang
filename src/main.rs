@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
-use zbus::object_server::InterfaceRef;
+use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -46,8 +46,12 @@ async fn main() -> eyre::Result<()> {
         connection::Builder::system()?
     };
 
-    let dbus_name = "dev.hasali.fang";
-    let dbus = builder.name(dbus_name)?.build().await?;
+    let dbus_name = "dev.hasali.Fang";
+    let dbus = builder
+        .name(dbus_name)?
+        .serve_at("/dev/hasali/Fang", DeviceManagerService)?
+        .build()
+        .await?;
 
     info!(
         "Listening on dbus {} bus at {dbus_name}",
@@ -172,7 +176,7 @@ async fn handle_udev_event(
 
                 let uuid = Uuid::new_v4();
                 let object_path =
-                    OwnedObjectPath::try_from(format!("/dev/hasali/fang/{}", uuid.simple()))?;
+                    OwnedObjectPath::try_from(format!("/dev/hasali/Fang/{}", uuid.simple()))?;
 
                 let mut mouse = Mouse::new(
                     hid_device.clone(),
@@ -216,8 +220,15 @@ async fn handle_udev_event(
                     }),
                 );
 
-                device.registered_objects.push(object_path);
+                device.registered_objects.push(object_path.clone());
                 device.reader_task = Some(reader_task.abort_handle());
+
+                dbus.object_server()
+                    .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
+                    .await?
+                    .signal_emitter()
+                    .device_added(object_path)
+                    .await?;
             }
         }
         DeviceAction::Remove => {
@@ -246,11 +257,19 @@ async fn handle_udev_event(
                 "Device disconnected"
             );
 
-            for path in &device.registered_objects {
+            for path in device.registered_objects {
                 dbus.object_server()
-                    .remove::<RazerMouseService, _>(path)
+                    .remove::<RazerMouseService, _>(&path)
                     .await?;
-                info!(path = %path, "Unregistered device")
+
+                info!(path = %path, "Unregistered device");
+
+                dbus.object_server()
+                    .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
+                    .await?
+                    .signal_emitter()
+                    .device_removed(path)
+                    .await?;
             }
 
             poller.unregister(event.device.usb_device_syspath.into_os_string());
@@ -357,6 +376,18 @@ async fn read_device_events(
     }
 }
 
+struct DeviceManagerService;
+
+#[interface(name = "dev.hasali.Fang.DeviceManager")]
+impl DeviceManagerService {
+    #[zbus(signal)]
+    async fn device_added(emitter: &SignalEmitter<'_>, path: OwnedObjectPath) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn device_removed(emitter: &SignalEmitter<'_>, path: OwnedObjectPath)
+    -> zbus::Result<()>;
+}
+
 struct RazerMouseService {
     state: MouseState,
 }
@@ -367,7 +398,7 @@ struct MouseState {
     is_charging: bool,
 }
 
-#[interface(name = "dev.hasali.fang.mouse")]
+#[interface(name = "dev.hasali.Fang.Mouse")]
 impl RazerMouseService {
     #[zbus(property)]
     async fn is_connected(&self) -> bool {
