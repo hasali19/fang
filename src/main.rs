@@ -406,6 +406,12 @@ impl RazerMouseService {
     }
 
     #[zbus(property)]
+    async fn has_battery(&self) -> bool {
+        // TODO: Implement properly once we have support for wired mice
+        true
+    }
+
+    #[zbus(property)]
     async fn battery_level(&self) -> u8 {
         self.state.battery_level
     }
