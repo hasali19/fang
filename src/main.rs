@@ -7,7 +7,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{env, thread};
 
@@ -165,18 +164,25 @@ async fn handle_udev_event(
                     return Ok(());
                 }
 
-                let is_connected = Arc::new(AtomicBool::new(*status == 1));
-
                 let uuid = Uuid::new_v4();
                 let object_path =
                     OwnedObjectPath::try_from(format!("/dev/hasali/fang/{}", uuid.simple()))?;
 
+                let mut mouse = Mouse::new(
+                    hid_device.clone(),
+                    RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
+                );
+
+                let battery_level = mouse.get_battery_level()?;
+                let is_charging = mouse.get_charging_status()? == 1;
+
                 let service = RazerMouseService {
-                    mouse: Mutex::new(Mouse::new(
-                        hid_device.clone(),
-                        RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
-                    )),
-                    is_connected: is_connected.clone(),
+                    mouse: Mutex::new(mouse),
+                    state: MouseState {
+                        is_connected: *status == 1,
+                        battery_level,
+                        is_charging,
+                    },
                 };
 
                 dbus.object_server().at(&object_path, service).await?;
@@ -190,7 +196,6 @@ async fn handle_udev_event(
 
                 let reader_task = tokio::spawn(run_device_reader(
                     known_interfaces[&1].clone(),
-                    is_connected.clone(),
                     mouse_interface,
                 ));
 
@@ -239,19 +244,14 @@ async fn handle_udev_event(
     Ok(())
 }
 
-async fn run_device_reader(
-    devnode: PathBuf,
-    state: Arc<AtomicBool>,
-    mouse_interface: InterfaceRef<RazerMouseService>,
-) {
-    if let Err(error) = read_device_events(&devnode, &state, mouse_interface).await {
+async fn run_device_reader(devnode: PathBuf, mouse_interface: InterfaceRef<RazerMouseService>) {
+    if let Err(error) = read_device_events(&devnode, mouse_interface).await {
         error!(?error, "Error in reader thread");
     }
 }
 
 async fn read_device_events(
     path: &Path,
-    state: &AtomicBool,
     mouse_interface: InterfaceRef<RazerMouseService>,
 ) -> eyre::Result<()> {
     let file = DeviceFile::open(path)?;
@@ -260,7 +260,12 @@ async fn read_device_events(
     loop {
         let size = file.read(&mut buf).await?;
 
-        ensure!(size == buf.len());
+        ensure!(
+            size == buf.len(),
+            "Unexpected size for input report: {size}"
+        );
+
+        let mut mouse_service = mouse_interface.get_mut().await;
 
         if buf[0] == 5 && buf[1] == 9 {
             let is_connected = match buf[2] {
@@ -272,11 +277,27 @@ async fn read_device_events(
                 }
             };
 
-            if state.swap(is_connected, Ordering::AcqRel) != is_connected {
-                mouse_interface
-                    .get()
-                    .await
+            if mouse_service.state.is_connected != is_connected {
+                mouse_service.state.is_connected = is_connected;
+                mouse_service
                     .is_connected_changed(mouse_interface.signal_emitter())
+                    .await?;
+            }
+        } else if buf[0] == 5 && buf[1] == 49 {
+            let battery_level = ((f64::from(buf[2]) / 255.0) * 100.0) as u8;
+            let is_charging = buf[3] == 1;
+
+            if mouse_service.state.battery_level != battery_level {
+                mouse_service.state.battery_level = battery_level;
+                mouse_service
+                    .battery_level_changed(mouse_interface.signal_emitter())
+                    .await?;
+            }
+
+            if mouse_service.state.is_charging != is_charging {
+                mouse_service.state.is_charging = is_charging;
+                mouse_service
+                    .is_charging_changed(mouse_interface.signal_emitter())
                     .await?;
             }
         } else {
@@ -293,14 +314,30 @@ struct BatteryStatus {
 
 struct RazerMouseService {
     mouse: Mutex<Mouse>,
-    is_connected: Arc<AtomicBool>,
+    state: MouseState,
+}
+
+struct MouseState {
+    is_connected: bool,
+    battery_level: u8,
+    is_charging: bool,
 }
 
 #[interface(name = "dev.hasali.fang.mouse")]
 impl RazerMouseService {
     #[zbus(property)]
     async fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Acquire)
+        self.state.is_connected
+    }
+
+    #[zbus(property)]
+    async fn battery_level(&self) -> u8 {
+        self.state.battery_level
+    }
+
+    #[zbus(property)]
+    async fn is_charging(&self) -> bool {
+        self.state.is_charging
     }
 
     async fn get_battery_status(&self) -> zbus::fdo::Result<BatteryStatus> {
