@@ -1,7 +1,7 @@
 mod dev;
 mod udev;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
+use zbus::object_server::InterfaceRef;
 use zbus::zvariant::{OwnedObjectPath, Type};
 use zbus::{connection, interface};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -85,20 +86,20 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
 }
 
 struct DeviceManager {
-    // Maps usb device syspath to list of known hid interfaces
     hid_interface_map: BTreeMap<PathBuf, BTreeMap<u8, PathBuf>>,
-    // Maps a device syspath to one or more dbus object paths
-    registered_objects: HashMap<PathBuf, Vec<OwnedObjectPath>>,
-    // Maps a device syspath to the device state
-    devices: HashMap<PathBuf, (Arc<AtomicBool>, tokio::task::AbortHandle)>,
+    devices: BTreeMap<PathBuf, Device>,
+}
+
+struct Device {
+    registered_objects: Vec<OwnedObjectPath>,
+    reader_task: Option<tokio::task::AbortHandle>,
 }
 
 impl DeviceManager {
     fn new() -> DeviceManager {
         DeviceManager {
             hid_interface_map: BTreeMap::default(),
-            registered_objects: HashMap::default(),
-            devices: HashMap::default(),
+            devices: BTreeMap::default(),
         }
     }
 }
@@ -136,43 +137,26 @@ async fn handle_udev_event(
             info!(syspath = %usb_syspath.display(), "Device connected");
 
             // The Mouse Dock Pro has two interfaces that we care about.
-            // Interface 0 is the main one where we can use feature reports to send commands to the device.
-            // Interface 1 sends input reports where we get notifications for connection status and other state changes.
-
-            let iface1_devnode = known_interfaces[&1].clone();
-            let wireless_connection_state = Arc::new(AtomicBool::new(false));
-
-            let reader_task = tokio::spawn({
-                let wireless_connection_state = wireless_connection_state.clone();
-                async move {
-                    if let Err(error) =
-                        read_device_events(&iface1_devnode, &wireless_connection_state).await
-                    {
-                        error!(?error, "Error in reader thread");
-                    }
-                }
-            });
+            // Interface 0 is the main one where we can use feature reports to
+            // send commands to the device.
+            // Interface 1 sends input reports where we get notifications for
+            // connection status and other state changes.
 
             let devnode = CString::new(known_interfaces[&0].as_os_str().as_bytes())?;
-            let device = Arc::new(Mutex::new(hid.open_path(&devnode)?));
+            let hid_device = Arc::new(Mutex::new(hid.open_path(&devnode)?));
 
-            let mut dock = MouseDock::new(device.clone());
+            let mut dock = MouseDock::new(hid_device.clone());
 
             // FIXME: Don't do blocking io on this thread
             let paired_device = dock.get_paired_device()?;
 
-            let object_paths = device_manager
-                .registered_objects
+            let device = device_manager
+                .devices
                 .entry(usb_syspath.clone())
-                .or_default();
-
-            device_manager.devices.insert(
-                usb_syspath,
-                (
-                    wireless_connection_state.clone(),
-                    reader_task.abort_handle(),
-                ),
-            );
+                .or_insert_with(|| Device {
+                    registered_objects: vec![],
+                    reader_task: None,
+                });
 
             if let Some((status, pid)) = &paired_device {
                 info!(pid, connected = *status == 1, "Discovered paired device");
@@ -181,7 +165,7 @@ async fn handle_udev_event(
                     return Ok(());
                 }
 
-                wireless_connection_state.store(*status == 1, Ordering::Release);
+                let is_connected = Arc::new(AtomicBool::new(*status == 1));
 
                 let uuid = Uuid::new_v4();
                 let object_path =
@@ -189,22 +173,46 @@ async fn handle_udev_event(
 
                 let service = RazerMouseService {
                     mouse: Mutex::new(Mouse::new(
-                        device.clone(),
+                        hid_device.clone(),
                         RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
                     )),
-                    is_connected: wireless_connection_state,
+                    is_connected: is_connected.clone(),
                 };
 
                 dbus.object_server().at(&object_path, service).await?;
 
+                let mouse_interface: InterfaceRef<RazerMouseService> =
+                    dbus.object_server().interface(&object_path).await?;
+
                 info!(path = %object_path, "Registered device");
 
-                object_paths.push(object_path);
+                device.registered_objects.push(object_path);
+
+                let reader_task = tokio::spawn(run_device_reader(
+                    known_interfaces[&1].clone(),
+                    is_connected.clone(),
+                    mouse_interface,
+                ));
+
+                device.reader_task = Some(reader_task.abort_handle());
             }
         }
         DeviceAction::Remove => {
-            let Some(paths) = device_manager
-                .registered_objects
+            if let Some(hid_interfaces) = device_manager
+                .hid_interface_map
+                .get_mut(&event.device.usb_device_syspath)
+            {
+                hid_interfaces.remove(&event.device.interface_number);
+
+                if hid_interfaces.is_empty() {
+                    device_manager
+                        .hid_interface_map
+                        .remove(&event.device.usb_device_syspath);
+                }
+            }
+
+            let Some(device) = device_manager
+                .devices
                 .remove(&event.device.usb_device_syspath)
             else {
                 return Ok(());
@@ -215,17 +223,14 @@ async fn handle_udev_event(
                 "Device disconnected"
             );
 
-            for path in &paths {
+            for path in &device.registered_objects {
                 dbus.object_server()
                     .remove::<RazerMouseService, _>(path)
                     .await?;
                 info!(path = %path, "Unregistered device")
             }
 
-            if let Some((_, reader_task)) = device_manager
-                .devices
-                .remove(&event.device.usb_device_syspath)
-            {
+            if let Some(reader_task) = device.reader_task {
                 reader_task.abort();
             }
         }
@@ -234,7 +239,21 @@ async fn handle_udev_event(
     Ok(())
 }
 
-async fn read_device_events(path: &Path, state: &AtomicBool) -> eyre::Result<()> {
+async fn run_device_reader(
+    devnode: PathBuf,
+    state: Arc<AtomicBool>,
+    mouse_interface: InterfaceRef<RazerMouseService>,
+) {
+    if let Err(error) = read_device_events(&devnode, &state, mouse_interface).await {
+        error!(?error, "Error in reader thread");
+    }
+}
+
+async fn read_device_events(
+    path: &Path,
+    state: &AtomicBool,
+    mouse_interface: InterfaceRef<RazerMouseService>,
+) -> eyre::Result<()> {
     let file = DeviceFile::open(path)?;
 
     let mut buf = [0; 16];
@@ -253,7 +272,13 @@ async fn read_device_events(path: &Path, state: &AtomicBool) -> eyre::Result<()>
                 }
             };
 
-            state.swap(is_connected, Ordering::AcqRel);
+            if state.swap(is_connected, Ordering::AcqRel) != is_connected {
+                mouse_interface
+                    .get()
+                    .await
+                    .is_connected_changed(mouse_interface.signal_emitter())
+                    .await?;
+            }
         } else {
             trace!("Unrecognised event: {buf:?}");
         }
