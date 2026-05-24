@@ -1,4 +1,5 @@
 mod dev;
+mod poller;
 mod udev;
 
 use std::collections::BTreeMap;
@@ -13,16 +14,16 @@ use std::{env, thread};
 use eyre::{ensure, eyre};
 use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 use zbus::object_server::InterfaceRef;
-use zbus::zvariant::{OwnedObjectPath, Type};
+use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::dev::DeviceFile;
+use crate::poller::Poller;
 use crate::udev::{DeviceAction, DeviceMonitor};
 
 const RAZER_VID: u16 = 0x1532;
@@ -53,14 +54,16 @@ async fn main() -> eyre::Result<()> {
         if use_session_bus { "session" } else { "system" }
     );
 
-    tokio::task::spawn_local(run_device_monitor(dbus));
+    let poller = Poller::spawn();
+
+    tokio::task::spawn_local(run_device_monitor(dbus, poller));
 
     tokio::signal::ctrl_c().await?;
 
     Ok(())
 }
 
-async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
+async fn run_device_monitor(dbus: zbus::Connection, poller: Poller) -> eyre::Result<()> {
     let mut device_manager = DeviceManager::new();
 
     let hid = HidApi::new()?;
@@ -76,7 +79,9 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
             }
         };
 
-        if let Err(error) = handle_udev_event(&hid, &mut device_manager, &dbus, event).await {
+        if let Err(error) =
+            handle_udev_event(&hid, &mut device_manager, &dbus, &poller, event).await
+        {
             error!(?error, "Failed to handle udev event");
         }
     }
@@ -107,6 +112,7 @@ async fn handle_udev_event(
     hid: &HidApi,
     device_manager: &mut DeviceManager,
     dbus: &zbus::Connection,
+    poller: &Poller,
     event: udev::DeviceEvent,
 ) -> eyre::Result<()> {
     match event.action {
@@ -177,7 +183,6 @@ async fn handle_udev_event(
                 let is_charging = mouse.get_charging_status()? == 1;
 
                 let service = RazerMouseService {
-                    mouse: Mutex::new(mouse),
                     state: MouseState {
                         is_connected: *status == 1,
                         battery_level,
@@ -187,18 +192,31 @@ async fn handle_udev_event(
 
                 dbus.object_server().at(&object_path, service).await?;
 
+                info!(path = %object_path, "Registered device");
+
                 let mouse_interface: InterfaceRef<RazerMouseService> =
                     dbus.object_server().interface(&object_path).await?;
 
-                info!(path = %object_path, "Registered device");
-
-                device.registered_objects.push(object_path);
-
                 let reader_task = tokio::spawn(run_device_reader(
                     known_interfaces[&1].clone(),
-                    mouse_interface,
+                    mouse_interface.clone(),
                 ));
 
+                let rt = tokio::runtime::Handle::current();
+
+                poller.register(
+                    usb_syspath.into_os_string(),
+                    Duration::from_secs(150),
+                    Box::new(move || {
+                        if let Err(error) =
+                            poll_device_state(&mut mouse, mouse_interface.clone(), &rt)
+                        {
+                            error!(?error, "Failed to poll mouse state");
+                        }
+                    }),
+                );
+
+                device.registered_objects.push(object_path);
                 device.reader_task = Some(reader_task.abort_handle());
             }
         }
@@ -235,6 +253,8 @@ async fn handle_udev_event(
                 info!(path = %path, "Unregistered device")
             }
 
+            poller.unregister(event.device.usb_device_syspath.into_os_string());
+
             if let Some(reader_task) = device.reader_task {
                 reader_task.abort();
             }
@@ -242,6 +262,37 @@ async fn handle_udev_event(
     }
 
     Ok(())
+}
+
+fn poll_device_state(
+    mouse: &mut Mouse,
+    mouse_interface: InterfaceRef<RazerMouseService>,
+    rt: &tokio::runtime::Handle,
+) -> eyre::Result<()> {
+    // TODO: These calls will fail if the mouse has gone to sleep. Need to notify the thread to
+    // pause polling.
+    let battery_level = mouse.get_battery_level()?;
+    let is_charging = mouse.get_charging_status()? == 1;
+
+    rt.block_on(async move {
+        let mut mouse_service = mouse_interface.get_mut().await;
+
+        if mouse_service.state.battery_level != battery_level {
+            mouse_service.state.battery_level = battery_level;
+            mouse_service
+                .battery_level_changed(mouse_interface.signal_emitter())
+                .await?;
+        }
+
+        if mouse_service.state.is_charging != is_charging {
+            mouse_service.state.is_charging = is_charging;
+            mouse_service
+                .is_charging_changed(mouse_interface.signal_emitter())
+                .await?;
+        }
+
+        Ok::<_, eyre::Report>(())
+    })
 }
 
 async fn run_device_reader(devnode: PathBuf, mouse_interface: InterfaceRef<RazerMouseService>) {
@@ -306,14 +357,7 @@ async fn read_device_events(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Type)]
-struct BatteryStatus {
-    level: u8,
-    charging: bool,
-}
-
 struct RazerMouseService {
-    mouse: Mutex<Mouse>,
     state: MouseState,
 }
 
@@ -338,23 +382,6 @@ impl RazerMouseService {
     #[zbus(property)]
     async fn is_charging(&self) -> bool {
         self.state.is_charging
-    }
-
-    async fn get_battery_status(&self) -> zbus::fdo::Result<BatteryStatus> {
-        let mut mouse = self.mouse.lock();
-
-        let level = mouse
-            .get_battery_level()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        let charging = mouse
-            .get_charging_status()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        Ok(BatteryStatus {
-            level,
-            charging: charging == 1,
-        })
     }
 }
 
