@@ -403,6 +403,11 @@ struct MouseState {
 
 #[interface(name = "dev.hasali.Fang.Mouse")]
 impl RazerMouseService {
+    #[zbus(property(emits_changed_signal = "const"))]
+    async fn name(&self) -> &'static str {
+        "Basilisk V3 Pro 35K"
+    }
+
     #[zbus(property)]
     async fn is_connected(&self) -> bool {
         self.state.is_connected
