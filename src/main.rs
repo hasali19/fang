@@ -288,12 +288,15 @@ fn poll_device_state(
     mouse_interface: InterfaceRef<RazerMouseService>,
     rt: &tokio::runtime::Handle,
 ) -> eyre::Result<()> {
-    // TODO: These calls will fail if the mouse has gone to sleep. Need to notify the thread to
-    // pause polling.
+    let is_connected = rt.block_on(async { mouse_interface.get().await.state.is_connected });
+    if !is_connected {
+        return Ok(());
+    }
+
     let battery_level = mouse.get_battery_level()?;
     let is_charging = mouse.get_charging_status()? == 1;
 
-    rt.block_on(async move {
+    rt.block_on(async {
         let mut mouse_service = mouse_interface.get_mut().await;
 
         if mouse_service.state.battery_level != battery_level {
@@ -405,7 +408,7 @@ impl RazerMouseService {
         self.state.is_connected
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn has_battery(&self) -> bool {
         // TODO: Implement properly once we have support for wired mice
         true

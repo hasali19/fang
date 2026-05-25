@@ -1,0 +1,8 @@
+[Unit]
+Description=Daemon for configuring Razer devices
+
+[Service]
+Type=dbus
+BusName=dev.hasali.Fang
+ExecStart=/usr/local/bin/fangd
+Restart=on-abort
