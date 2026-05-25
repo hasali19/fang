@@ -190,12 +190,14 @@ async fn handle_udev_event(
 
                 let battery_level = mouse.get_battery_level()?;
                 let is_charging = mouse.get_charging_status()? == 1;
+                let dpi = mouse.get_dpi()?;
 
                 let service = RazerMouseService {
                     state: MouseState {
                         is_connected: *status == 1,
                         battery_level,
                         is_charging,
+                        dpi,
                     },
                 };
 
@@ -345,7 +347,16 @@ async fn read_device_events(
 
         let mut mouse_service = mouse_interface.get_mut().await;
 
-        if buf[0] == 5 && buf[1] == 9 {
+        if buf[0] == 5 && buf[1] == 2 {
+            let dpi = u16::from_be_bytes([buf[2], buf[3]]);
+
+            if mouse_service.state.dpi != dpi {
+                mouse_service.state.dpi = dpi;
+                mouse_service
+                    .dpi_changed(mouse_interface.signal_emitter())
+                    .await?;
+            }
+        } else if buf[0] == 5 && buf[1] == 9 {
             let is_connected = match buf[2] {
                 2 => false,
                 3 => true,
@@ -404,6 +415,7 @@ struct MouseState {
     is_connected: bool,
     battery_level: u8,
     is_charging: bool,
+    dpi: u16,
 }
 
 #[interface(name = "dev.hasali.Fang.Mouse")]
@@ -432,6 +444,11 @@ impl RazerMouseService {
     #[zbus(property)]
     async fn is_charging(&self) -> bool {
         self.state.is_charging
+    }
+
+    #[zbus(property)]
+    async fn dpi(&self) -> u16 {
+        self.state.dpi
     }
 }
 
@@ -525,6 +542,24 @@ impl Mouse {
 
         Ok(r.data[1])
     }
+
+    pub fn get_dpi(&mut self) -> eyre::Result<u16> {
+        let r = device_request(
+            &self.device.lock(),
+            0xe0 | self.next_transaction_id,
+            0x04,
+            0x80 | 0x05,
+            7,
+            &[],
+        )?;
+
+        self.next_transaction_id += 1;
+        if self.next_transaction_id > self.base_transaction_id + 30 {
+            self.next_transaction_id = self.base_transaction_id;
+        }
+
+        Ok(u16::from_be_bytes([r.data[1], r.data[2]]))
+    }
 }
 
 #[derive(Immutable, IntoBytes, FromBytes)]
@@ -589,6 +624,7 @@ fn device_request(
 
     let res = send_and_receive(device, &mut req)?;
 
+    // TODO: Implement retry
     ensure!(res.status == 2);
     ensure!(res.transaction_id == req.transaction_id);
     ensure!(res.command_class == req.command_class);
