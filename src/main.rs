@@ -16,6 +16,7 @@ use hidapi::{HidApi, HidDevice};
 use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::OwnedObjectPath;
@@ -36,7 +37,11 @@ const RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID: u8 = 0xe0;
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
 
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let use_session_bus = env::args().any(|arg| arg == "--session");
 

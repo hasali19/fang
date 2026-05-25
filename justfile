@@ -2,6 +2,7 @@ build:
     cargo build --bin fangd --release
 
 install: build
+    sudo systemctl stop fangd || true
     sudo cp $(pwd)/target/release/fangd /usr/local/bin/
     sudo mkdir -p /etc/dbus-1/system.d
     sudo mkdir -p /etc/dbus-1/system-services
