@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
 
-use async_fn_stream::try_fn_stream;
+use async_fn_stream::{TryStreamEmitter, try_fn_stream};
 use tokio::io::unix::AsyncFd;
 use tokio_stream::{Stream, StreamExt};
 use udev::MonitorSocket;
@@ -185,5 +185,137 @@ impl Stream for AsyncMonitorSocket {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+pub struct UsbDeviceEvent {
+    pub action: DeviceAction,
+    pub device: UsbDeviceInfo,
+}
+
+pub struct UsbDeviceInfo {
+    pub sysname: OsString,
+    pub syspath: PathBuf,
+    pub product_id: u16,
+    /// Map from interface number to devnode (i.e. /dev/hidraw*)
+    pub hid_interfaces: BTreeMap<u8, PathBuf>,
+}
+
+pub struct UsbMonitor {
+    monitor: DeviceMonitor,
+    required_interfaces: BTreeMap<u16, Vec<u8>>,
+}
+
+impl UsbMonitor {
+    pub fn new(vendor_id: u16) -> eyre::Result<UsbMonitor> {
+        Ok(UsbMonitor {
+            monitor: DeviceMonitor::new(vendor_id)?,
+            required_interfaces: BTreeMap::new(),
+        })
+    }
+
+    pub fn with_product(mut self, pid: u16, interfaces: Vec<u8>) -> UsbMonitor {
+        self.required_interfaces.insert(pid, interfaces);
+        self
+    }
+
+    pub fn events(self) -> impl Stream<Item = io::Result<UsbDeviceEvent>> {
+        try_fn_stream(|emitter| self.emit_events(emitter))
+    }
+
+    async fn emit_events(
+        self,
+        emitter: TryStreamEmitter<UsbDeviceEvent, io::Error>,
+    ) -> io::Result<()> {
+        let mut connected_interfaces: BTreeMap<PathBuf, BTreeMap<u8, PathBuf>> =
+            BTreeMap::default();
+        let mut ready_devices: BTreeSet<PathBuf> = BTreeSet::new();
+
+        let mut events = pin!(self.monitor.events());
+
+        while let Some(event) = events.next().await {
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    emitter.emit_err(e).await;
+                    continue;
+                }
+            };
+
+            let Some(hid_interfaces) = self.required_interfaces.get(&event.device.product_id)
+            else {
+                continue;
+            };
+
+            if !hid_interfaces.contains(&event.device.interface_number) {
+                continue;
+            }
+
+            match event.action {
+                DeviceAction::Add => {
+                    if ready_devices.contains(&event.device.usb_device_syspath) {
+                        continue;
+                    }
+
+                    let connected_interfaces = connected_interfaces
+                        .entry(event.device.usb_device_syspath.clone())
+                        .or_default();
+
+                    connected_interfaces
+                        .insert(event.device.interface_number, event.device.devnode);
+
+                    // Keep waiting until all required usb interfaces are available
+                    if !hid_interfaces
+                        .iter()
+                        .all(|i| connected_interfaces.contains_key(i))
+                    {
+                        continue;
+                    }
+
+                    ready_devices.insert(event.device.usb_device_syspath.clone());
+
+                    emitter
+                        .emit(UsbDeviceEvent {
+                            action: DeviceAction::Add,
+                            device: UsbDeviceInfo {
+                                sysname: event.device.usb_device_sysname,
+                                syspath: event.device.usb_device_syspath,
+                                product_id: event.device.product_id,
+                                hid_interfaces: connected_interfaces.clone(),
+                            },
+                        })
+                        .await;
+                }
+                DeviceAction::Remove => {
+                    let Some(interfaces) =
+                        connected_interfaces.get_mut(&event.device.usb_device_syspath)
+                    else {
+                        continue;
+                    };
+
+                    if interfaces.remove(&event.device.interface_number).is_some() {
+                        ready_devices.remove(&event.device.usb_device_syspath);
+
+                        if interfaces.is_empty() {
+                            connected_interfaces.remove(&event.device.usb_device_syspath);
+                        }
+
+                        emitter
+                            .emit(UsbDeviceEvent {
+                                action: DeviceAction::Remove,
+                                device: UsbDeviceInfo {
+                                    sysname: event.device.usb_device_sysname,
+                                    syspath: event.device.usb_device_syspath,
+                                    product_id: event.device.product_id,
+                                    hid_interfaces: BTreeMap::new(),
+                                },
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
