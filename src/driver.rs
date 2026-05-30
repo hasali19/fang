@@ -41,6 +41,7 @@ impl MouseDock {
     }
 }
 
+#[derive(Clone)]
 pub struct Mouse {
     device: AsyncHidDevice,
     base_transaction_id: u8,
@@ -132,7 +133,7 @@ impl AsyncHidDevice {
                 .iter()
                 .fold(0u8, |acc, &b| acc ^ b);
 
-            trace!("write: {:?}", req_report.as_bytes());
+            trace!(?req_report, "write");
 
             device.send_feature_report(req_report.as_bytes())?;
 
@@ -142,9 +143,9 @@ impl AsyncHidDevice {
 
             device.get_feature_report(&mut response)?;
 
-            trace!("read: {:?}", response);
-
             let res_report = Report::read_from_bytes(&response).map_err(|e| eyre!("{e:?}"))?;
+
+            trace!(?res_report, "read");
 
             if res_report.status == 1 {
                 warn!("Device is busy, retrying command");
@@ -173,7 +174,7 @@ impl AsyncHidDevice {
     }
 }
 
-#[derive(Immutable, IntoBytes, FromBytes)]
+#[derive(Debug, Immutable, IntoBytes, FromBytes)]
 #[repr(C)]
 struct Report {
     report_id: u8,

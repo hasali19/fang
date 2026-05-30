@@ -13,7 +13,7 @@ use std::time::Duration;
 use eyre::ensure;
 use hidapi::HidApi;
 use tokio_stream::StreamExt;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::OwnedObjectPath;
@@ -162,18 +162,13 @@ async fn handle_udev_event(
                     RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
                 );
 
-                let battery_level = mouse.get_battery_level().await?;
-                let is_charging = mouse.get_charging_status().await? == 1;
-                let dpi = mouse.get_dpi().await?;
-
-                let service = RazerMouseService {
-                    state: MouseState {
-                        is_connected: *status == 1,
-                        battery_level,
-                        is_charging,
-                        dpi,
-                    },
+                let mouse_state = if *status == 1 {
+                    read_mouse_state(&mouse).await?
+                } else {
+                    MouseState::default()
                 };
+
+                let service = RazerMouseService { state: mouse_state };
 
                 dbus.object_server().at(&object_path, service).await?;
 
@@ -184,6 +179,7 @@ async fn handle_udev_event(
 
                 let reader_task = tokio::spawn(run_device_reader(
                     hid_interfaces[&1].clone(),
+                    mouse.clone(),
                     mouse_interface.clone(),
                 ));
 
@@ -279,14 +275,19 @@ async fn poll_device_state(
     Ok(())
 }
 
-async fn run_device_reader(devnode: PathBuf, mouse_interface: InterfaceRef<RazerMouseService>) {
-    if let Err(error) = read_device_events(&devnode, mouse_interface).await {
+async fn run_device_reader(
+    devnode: PathBuf,
+    mouse: Mouse,
+    mouse_interface: InterfaceRef<RazerMouseService>,
+) {
+    if let Err(error) = read_device_events(&devnode, &mouse, mouse_interface).await {
         error!(?error, "Error in reader thread");
     }
 }
 
 async fn read_device_events(
     path: &Path,
+    mouse: &Mouse,
     mouse_interface: InterfaceRef<RazerMouseService>,
 ) -> eyre::Result<()> {
     let file = DeviceFile::open(path)?;
@@ -323,6 +324,13 @@ async fn read_device_events(
 
             if mouse_service.state.is_connected != is_connected {
                 mouse_service.state.is_connected = is_connected;
+
+                debug!(is_connected, "Connection state changed");
+
+                if is_connected {
+                    mouse_service.state = read_mouse_state(mouse).await?;
+                }
+
                 mouse_service
                     .is_connected_changed(mouse_interface.signal_emitter())
                     .await?;
@@ -350,6 +358,19 @@ async fn read_device_events(
     }
 }
 
+async fn read_mouse_state(mouse: &Mouse) -> eyre::Result<MouseState> {
+    let battery_level = mouse.get_battery_level().await?;
+    let is_charging = mouse.get_charging_status().await? == 1;
+    let dpi = mouse.get_dpi().await?;
+
+    Ok(MouseState {
+        is_connected: true,
+        battery_level,
+        is_charging,
+        dpi,
+    })
+}
+
 struct DeviceManagerService;
 
 #[interface(name = "dev.hasali.Fang.DeviceManager")]
@@ -366,6 +387,7 @@ struct RazerMouseService {
     state: MouseState,
 }
 
+#[derive(Default)]
 struct MouseState {
     is_connected: bool,
     battery_level: u8,
