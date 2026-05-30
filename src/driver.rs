@@ -1,42 +1,35 @@
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use eyre::{ensure, eyre};
 use hidapi::HidDevice;
-use parking_lot::Mutex;
-use tracing::trace;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{trace, warn};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub struct MouseDock {
-    device: Arc<Mutex<HidDevice>>,
+    device: AsyncHidDevice,
     base_transaction_id: u8,
-    next_transaction_id: u8,
 }
 
 impl MouseDock {
-    pub fn new(device: Arc<Mutex<HidDevice>>) -> MouseDock {
+    pub fn new(device: AsyncHidDevice) -> MouseDock {
         MouseDock {
-            device,
-            base_transaction_id: 0x00,
-            next_transaction_id: 0x00,
+            device: device,
+            base_transaction_id: 0xe0,
         }
     }
 
-    pub fn get_paired_device(&mut self) -> eyre::Result<Option<(u8, u16)>> {
-        let r = device_request(
-            &self.device.lock(),
-            0xe0 | self.next_transaction_id,
-            0x00,
-            0x80 | 0x3f,
-            80,
-            &[],
-        )?;
-
-        self.next_transaction_id += 1;
-        if self.next_transaction_id == self.base_transaction_id + 31 {
-            self.next_transaction_id = self.base_transaction_id;
-        }
+    pub async fn get_paired_device(&self) -> eyre::Result<Option<(u8, u16)>> {
+        let r = self
+            .device
+            .request(Request::new(
+                self.base_transaction_id,
+                0x00,
+                0x80 | 0x3f,
+                80,
+            ))
+            .await?;
 
         let status = r.data[1];
         let pid = u16::from_be_bytes([r.data[2], r.data[3]]);
@@ -49,72 +42,134 @@ impl MouseDock {
 }
 
 pub struct Mouse {
-    device: Arc<Mutex<HidDevice>>,
+    device: AsyncHidDevice,
     base_transaction_id: u8,
-    next_transaction_id: u8,
 }
 
 impl Mouse {
-    pub fn new(device: Arc<Mutex<HidDevice>>, base_transaction_id: u8) -> Mouse {
+    pub fn new(device: AsyncHidDevice, base_transaction_id: u8) -> Mouse {
         Mouse {
             device,
             base_transaction_id,
-            next_transaction_id: base_transaction_id,
         }
     }
 
-    pub fn get_battery_level(&mut self) -> eyre::Result<u8> {
-        let r = device_request(
-            &self.device.lock(),
-            0xe0 | self.next_transaction_id,
-            0x07,
-            0x80 | 0x00,
-            2,
-            &[],
-        )?;
-
-        self.next_transaction_id += 1;
-        if self.next_transaction_id > self.base_transaction_id + 30 {
-            self.next_transaction_id = self.base_transaction_id;
-        }
+    pub async fn get_battery_level(&self) -> eyre::Result<u8> {
+        let r = self
+            .device
+            .request(Request::new(self.base_transaction_id, 0x07, 0x80 | 0x00, 2))
+            .await?;
 
         Ok((f64::from(r.data[1] as f64 / 255.0) * 100.0) as u8)
     }
 
-    pub fn get_charging_status(&mut self) -> eyre::Result<u8> {
-        let r = device_request(
-            &self.device.lock(),
-            0xe0 | self.next_transaction_id,
-            0x07,
-            0x80 | 0x04,
-            2,
-            &[],
-        )?;
-
-        self.next_transaction_id += 1;
-        if self.next_transaction_id > self.base_transaction_id + 30 {
-            self.next_transaction_id = self.base_transaction_id;
-        }
+    pub async fn get_charging_status(&self) -> eyre::Result<u8> {
+        let r = self
+            .device
+            .request(Request::new(self.base_transaction_id, 0x07, 0x80 | 0x04, 2))
+            .await?;
 
         Ok(r.data[1])
     }
 
-    pub fn get_dpi(&mut self) -> eyre::Result<u16> {
-        let r = device_request(
-            &self.device.lock(),
-            0xe0 | self.next_transaction_id,
-            0x04,
-            0x80 | 0x05,
-            7,
-            &[],
-        )?;
-
-        self.next_transaction_id += 1;
-        if self.next_transaction_id > self.base_transaction_id + 30 {
-            self.next_transaction_id = self.base_transaction_id;
-        }
+    pub async fn get_dpi(&self) -> eyre::Result<u16> {
+        let r = self
+            .device
+            .request(Request::new(self.base_transaction_id, 0x04, 0x80 | 0x05, 7))
+            .await?;
 
         Ok(u16::from_be_bytes([r.data[1], r.data[2]]))
+    }
+}
+
+#[derive(Clone)]
+pub struct AsyncHidDevice {
+    sender: mpsc::Sender<(Request, oneshot::Sender<eyre::Result<Report>>)>,
+}
+
+impl AsyncHidDevice {
+    pub fn create(device: HidDevice) -> AsyncHidDevice {
+        let (sender, mut receiver) =
+            mpsc::channel::<(Request, oneshot::Sender<eyre::Result<Report>>)>(8);
+
+        thread::spawn(move || {
+            let mut transaction_id = 0;
+
+            while let Some((task, reply_sender)) = receiver.blocking_recv() {
+                let _ = match Self::process_task(&device, task, transaction_id) {
+                    Ok(res) => reply_sender.send(Ok(res)),
+                    Err(error) => reply_sender.send(Err(error)),
+                };
+                transaction_id = (transaction_id + 1) % 31;
+            }
+        });
+
+        AsyncHidDevice { sender }
+    }
+
+    fn process_task(
+        device: &hidapi::HidDevice,
+        request: Request,
+        transaction_id: u8,
+    ) -> eyre::Result<Report> {
+        loop {
+            let mut req_report = Report {
+                report_id: 0,
+                status: 0,
+                transaction_id: request.base_transaction_id | transaction_id,
+                _reserved1: [0; _],
+                data_len: request.data_len,
+                command_class: request.command_class,
+                command_id: request.command_id,
+                data: [0; _],
+                checksum: 0,
+                _reserved2: 0,
+            };
+
+            req_report.data[..request.data.len()].copy_from_slice(&request.data);
+
+            req_report.checksum = req_report.as_bytes()[3..=88]
+                .iter()
+                .fold(0u8, |acc, &b| acc ^ b);
+
+            trace!("write: {:?}", req_report.as_bytes());
+
+            device.send_feature_report(req_report.as_bytes())?;
+
+            thread::sleep(Duration::from_millis(30));
+
+            let mut response = [0u8; 91];
+
+            device.get_feature_report(&mut response)?;
+
+            trace!("read: {:?}", response);
+
+            let res_report = Report::read_from_bytes(&response).map_err(|e| eyre!("{e:?}"))?;
+
+            if res_report.status == 1 {
+                warn!("Device is busy, retrying command");
+                continue;
+            }
+
+            // TODO: Implement retry
+            ensure!(
+                res_report.status == 2,
+                "Failed with status: {}",
+                res_report.status
+            );
+
+            ensure!(res_report.transaction_id == req_report.transaction_id);
+            ensure!(res_report.command_class == req_report.command_class);
+            ensure!(res_report.command_id == req_report.command_id);
+
+            return Ok(res_report);
+        }
+    }
+
+    async fn request(&self, request: Request) -> eyre::Result<Report> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender.send((request, reply_sender)).await?;
+        reply_receiver.await?
     }
 }
 
@@ -133,58 +188,27 @@ struct Report {
     _reserved2: u8,
 }
 
-fn send_and_receive(device: &hidapi::HidDevice, report: &mut Report) -> eyre::Result<Report> {
-    report.checksum = report.as_bytes()[3..=88]
-        .iter()
-        .fold(0u8, |acc, &b| acc ^ b);
-
-    trace!("write: {:?}", report.as_bytes());
-
-    device.send_feature_report(report.as_bytes())?;
-
-    thread::sleep(Duration::from_millis(30));
-
-    let mut response = [0u8; 91];
-
-    device.get_feature_report(&mut response)?;
-
-    trace!("read: {:?}", response);
-
-    let report = Report::read_from_bytes(&response).map_err(|e| eyre!("{e:?}"))?;
-
-    Ok(report)
-}
-
-fn device_request(
-    device: &hidapi::HidDevice,
-    transaction_id: u8,
+struct Request {
+    base_transaction_id: u8,
+    data_len: u8,
     command_class: u8,
     command_id: u8,
-    data_len: u8,
-    data: &[u8],
-) -> eyre::Result<Report> {
-    let mut req = Report {
-        report_id: 0,
-        status: 0,
-        transaction_id,
-        _reserved1: [0; _],
-        data_len,
-        command_class,
-        command_id,
-        data: [0; _],
-        checksum: 0,
-        _reserved2: 0,
-    };
+    data: [u8; 80],
+}
 
-    req.data[..data.len()].copy_from_slice(data);
+impl Request {
+    fn new(base_transaction_id: u8, command_class: u8, command_id: u8, data_len: u8) -> Request {
+        Request {
+            base_transaction_id,
+            data_len,
+            command_class,
+            command_id,
+            data: [0; _],
+        }
+    }
 
-    let res = send_and_receive(device, &mut req)?;
-
-    // TODO: Implement retry
-    ensure!(res.status == 2);
-    ensure!(res.transaction_id == req.transaction_id);
-    ensure!(res.command_class == req.command_class);
-    ensure!(res.command_id == req.command_id);
-
-    Ok(res)
+    fn with_data(mut self, data: &[u8]) -> Request {
+        self.data[..data.len()].copy_from_slice(data);
+        self
+    }
 }

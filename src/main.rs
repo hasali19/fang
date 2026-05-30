@@ -1,6 +1,5 @@
 mod dev;
 mod driver;
-mod poller;
 mod udev;
 
 use std::collections::BTreeMap;
@@ -9,12 +8,10 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::ensure;
 use hidapi::HidApi;
-use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
@@ -23,8 +20,7 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 
 use crate::dev::DeviceFile;
-use crate::driver::{Mouse, MouseDock};
-use crate::poller::Poller;
+use crate::driver::{AsyncHidDevice, Mouse, MouseDock};
 use crate::udev::{DeviceAction, UsbMonitor};
 
 const RAZER_VID: u16 = 0x1532;
@@ -63,20 +59,24 @@ async fn main() -> eyre::Result<()> {
         if use_session_bus { "session" } else { "system" }
     );
 
-    let poller = Poller::spawn();
-
-    tokio::task::spawn_local(run_device_monitor(dbus, poller));
+    tokio::task::spawn_local(run_device_monitor(dbus));
 
     tokio::signal::ctrl_c().await?;
 
     Ok(())
 }
 
-async fn run_device_monitor(dbus: zbus::Connection, poller: Poller) -> eyre::Result<()> {
+async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
     let mut device_manager = DeviceManager::new();
 
     let hid = HidApi::new()?;
-    let monitor = UsbMonitor::new(RAZER_VID)?.with_product(RAZER_MOUSE_DOCK_PRO_PID, vec![0, 1]);
+    let monitor = UsbMonitor::new(RAZER_VID)?
+        // The Mouse Dock Pro has two interfaces that we care about.
+        // Interface 0 is the main one where we can write feature reports to
+        // send commands to the device.
+        // Interface 1 sends input reports where we get notifications for
+        // connection status and other state changes.
+        .with_product(RAZER_MOUSE_DOCK_PRO_PID, vec![0, 1]);
 
     let mut events = pin!(monitor.events());
     while let Some(event) = events.next().await {
@@ -88,9 +88,7 @@ async fn run_device_monitor(dbus: zbus::Connection, poller: Poller) -> eyre::Res
             }
         };
 
-        if let Err(error) =
-            handle_udev_event(&hid, &mut device_manager, &dbus, &poller, event).await
-        {
+        if let Err(error) = handle_udev_event(&hid, &mut device_manager, &dbus, event).await {
             error!(?error, "Failed to handle udev event");
         }
     }
@@ -104,7 +102,7 @@ struct DeviceManager {
 
 struct Device {
     registered_objects: Vec<OwnedObjectPath>,
-    reader_task: Option<tokio::task::AbortHandle>,
+    tasks: Vec<tokio::task::AbortHandle>,
 }
 
 impl DeviceManager {
@@ -119,7 +117,6 @@ async fn handle_udev_event(
     hid: &HidApi,
     device_manager: &mut DeviceManager,
     dbus: &zbus::Connection,
-    poller: &Poller,
     event: udev::UsbDeviceEvent,
 ) -> eyre::Result<()> {
     match event.action {
@@ -129,30 +126,23 @@ async fn handle_udev_event(
             }
 
             let usb_syspath = event.device.syspath;
-            let known_interfaces = event.device.hid_interfaces;
+            let hid_interfaces = event.device.hid_interfaces;
 
             info!(syspath = %usb_syspath.display(), "Device connected");
 
-            // The Mouse Dock Pro has two interfaces that we care about.
-            // Interface 0 is the main one where we can use feature reports to
-            // send commands to the device.
-            // Interface 1 sends input reports where we get notifications for
-            // connection status and other state changes.
+            let devnode = CString::new(hid_interfaces[&0].as_os_str().as_bytes())?;
+            let hid_device = AsyncHidDevice::create(hid.open_path(&devnode)?);
 
-            let devnode = CString::new(known_interfaces[&0].as_os_str().as_bytes())?;
-            let hid_device = Arc::new(Mutex::new(hid.open_path(&devnode)?));
+            let dock = MouseDock::new(hid_device.clone());
 
-            let mut dock = MouseDock::new(hid_device.clone());
-
-            // FIXME: Don't do blocking io on this thread
-            let paired_device = dock.get_paired_device()?;
+            let paired_device = dock.get_paired_device().await?;
 
             let device = device_manager
                 .devices
                 .entry(usb_syspath.clone())
                 .or_insert_with(|| Device {
                     registered_objects: vec![],
-                    reader_task: None,
+                    tasks: vec![],
                 });
 
             if let Some((status, pid)) = &paired_device {
@@ -167,14 +157,14 @@ async fn handle_udev_event(
                 let object_path =
                     OwnedObjectPath::try_from(format!("/dev/hasali/Fang/{}", object_name))?;
 
-                let mut mouse = Mouse::new(
+                let mouse = Mouse::new(
                     hid_device.clone(),
                     RAZER_BASILISK_V3_PRO_35K_WIRELESS_BASE_TXN_ID,
                 );
 
-                let battery_level = mouse.get_battery_level()?;
-                let is_charging = mouse.get_charging_status()? == 1;
-                let dpi = mouse.get_dpi()?;
+                let battery_level = mouse.get_battery_level().await?;
+                let is_charging = mouse.get_charging_status().await? == 1;
+                let dpi = mouse.get_dpi().await?;
 
                 let service = RazerMouseService {
                     state: MouseState {
@@ -193,26 +183,16 @@ async fn handle_udev_event(
                     dbus.object_server().interface(&object_path).await?;
 
                 let reader_task = tokio::spawn(run_device_reader(
-                    known_interfaces[&1].clone(),
+                    hid_interfaces[&1].clone(),
                     mouse_interface.clone(),
                 ));
 
-                let rt = tokio::runtime::Handle::current();
-
-                poller.register(
-                    usb_syspath.into_os_string(),
-                    Duration::from_secs(150),
-                    Box::new(move || {
-                        if let Err(error) =
-                            poll_device_state(&mut mouse, mouse_interface.clone(), &rt)
-                        {
-                            error!(?error, "Failed to poll mouse state");
-                        }
-                    }),
-                );
+                let poller_task = tokio::spawn(run_device_poller(mouse, mouse_interface));
 
                 device.registered_objects.push(object_path.clone());
-                device.reader_task = Some(reader_task.abort_handle());
+
+                device.tasks.push(reader_task.abort_handle());
+                device.tasks.push(poller_task.abort_handle());
 
                 dbus.object_server()
                     .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
@@ -247,10 +227,8 @@ async fn handle_udev_event(
                     .await?;
             }
 
-            poller.unregister(event.device.syspath.into_os_string());
-
-            if let Some(reader_task) = device.reader_task {
-                reader_task.abort();
+            for task in device.tasks {
+                task.abort();
             }
         }
     }
@@ -258,38 +236,47 @@ async fn handle_udev_event(
     Ok(())
 }
 
-fn poll_device_state(
-    mouse: &mut Mouse,
+async fn run_device_poller(mouse: Mouse, mouse_interface: InterfaceRef<RazerMouseService>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(150)).await;
+
+        info!("Polling mouse state");
+
+        if let Err(error) = poll_device_state(&mouse, mouse_interface.clone()).await {
+            error!(?error, "Failed to poll mouse state");
+        }
+    }
+}
+
+async fn poll_device_state(
+    mouse: &Mouse,
     mouse_interface: InterfaceRef<RazerMouseService>,
-    rt: &tokio::runtime::Handle,
 ) -> eyre::Result<()> {
-    let is_connected = rt.block_on(async { mouse_interface.get().await.state.is_connected });
+    let is_connected = mouse_interface.get().await.state.is_connected;
     if !is_connected {
         return Ok(());
     }
 
-    let battery_level = mouse.get_battery_level()?;
-    let is_charging = mouse.get_charging_status()? == 1;
+    let battery_level = mouse.get_battery_level().await?;
+    let is_charging = mouse.get_charging_status().await? == 1;
 
-    rt.block_on(async {
-        let mut mouse_service = mouse_interface.get_mut().await;
+    let mut mouse_service = mouse_interface.get_mut().await;
 
-        if mouse_service.state.battery_level != battery_level {
-            mouse_service.state.battery_level = battery_level;
-            mouse_service
-                .battery_level_changed(mouse_interface.signal_emitter())
-                .await?;
-        }
+    if mouse_service.state.battery_level != battery_level {
+        mouse_service.state.battery_level = battery_level;
+        mouse_service
+            .battery_level_changed(mouse_interface.signal_emitter())
+            .await?;
+    }
 
-        if mouse_service.state.is_charging != is_charging {
-            mouse_service.state.is_charging = is_charging;
-            mouse_service
-                .is_charging_changed(mouse_interface.signal_emitter())
-                .await?;
-        }
+    if mouse_service.state.is_charging != is_charging {
+        mouse_service.state.is_charging = is_charging;
+        mouse_service
+            .is_charging_changed(mouse_interface.signal_emitter())
+            .await?;
+    }
 
-        Ok::<_, eyre::Report>(())
-    })
+    Ok(())
 }
 
 async fn run_device_reader(devnode: PathBuf, mouse_interface: InterfaceRef<RazerMouseService>) {
