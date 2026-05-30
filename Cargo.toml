@@ -7,6 +7,7 @@ edition = "2024"
 async-fn-stream = "0.3.2"
 color-eyre = "0.6.5"
 eyre = "0.6.12"
+hex = "0.4.3"
 hidapi = "2.6.6"
 nix = { version = "0.31.3", features = ["fs"] }
 parking_lot = "0.12.5"
@@ -15,7 +16,6 @@ tokio-stream = "0.1.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 udev = "0.9.3"
-uuid = { version = "1.23.1", features = ["v4"] }
 zbus = "5.15.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 

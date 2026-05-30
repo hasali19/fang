@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -100,6 +101,7 @@ pub struct DeviceEvent {
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub hidraw_syspath: PathBuf,
+    pub usb_device_sysname: OsString,
     pub usb_device_syspath: PathBuf,
     pub devnode: PathBuf,
     pub product_id: u16,
@@ -131,8 +133,9 @@ impl DeviceInfo {
         }
 
         Some(DeviceInfo {
-            hidraw_syspath: device.syspath().to_path_buf(),
-            usb_device_syspath: usb_device.syspath().to_path_buf(),
+            hidraw_syspath: device.syspath().to_owned(),
+            usb_device_sysname: usb_device.sysname().to_owned(),
+            usb_device_syspath: usb_device.syspath().to_owned(),
             devnode,
             product_id: pid,
             interface_number,

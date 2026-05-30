@@ -17,7 +17,6 @@ use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
@@ -179,9 +178,10 @@ async fn handle_udev_event(
                     return Ok(());
                 }
 
-                let uuid = Uuid::new_v4();
+                let sysname_hex = hex::encode(event.device.usb_device_sysname.as_bytes());
+                let object_name = format!("{RAZER_VID}_{pid}_{sysname_hex}");
                 let object_path =
-                    OwnedObjectPath::try_from(format!("/dev/hasali/Fang/{}", uuid.simple()))?;
+                    OwnedObjectPath::try_from(format!("/dev/hasali/Fang/{}", object_name))?;
 
                 let mut mouse = Mouse::new(
                     hid_device.clone(),
