@@ -4,7 +4,7 @@ mod udev;
 
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -15,7 +15,8 @@ use hidapi::HidApi;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
-use zbus::object_server::{InterfaceRef, SignalEmitter};
+use zbus::names::InterfaceName;
+use zbus::object_server::{Interface, InterfaceRef, SignalEmitter};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 
@@ -67,7 +68,8 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
-    let mut device_manager = DeviceManager::new();
+    let device_manager_interface = dbus.object_server().interface("/dev/hasali/Fang").await?;
+    let mut device_manager = DeviceManager::new(device_manager_interface);
 
     let hid = HidApi::new()?;
     let monitor = UsbMonitor::new(RAZER_VID)?
@@ -98,19 +100,70 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
 
 struct DeviceManager {
     devices: BTreeMap<PathBuf, Device>,
+    interface: InterfaceRef<DeviceManagerService>,
 }
 
 struct Device {
-    registered_objects: Vec<OwnedObjectPath>,
+    registered_objects: Vec<DeviceObject>,
+}
+
+struct DeviceObject {
+    path: OwnedObjectPath,
+    interfaces: Vec<InterfaceName<'static>>,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 
 impl DeviceManager {
-    fn new() -> DeviceManager {
+    fn new(interface: InterfaceRef<DeviceManagerService>) -> DeviceManager {
         DeviceManager {
             devices: BTreeMap::default(),
+            interface,
         }
     }
+
+    fn add_object(&mut self, syspath: PathBuf, object: DeviceObject) {
+        self.devices
+            .entry(syspath)
+            .or_insert_with(|| Device {
+                registered_objects: vec![],
+            })
+            .registered_objects
+            .push(object);
+    }
+
+    fn remove_device(&mut self, syspath: &Path) -> Option<Device> {
+        self.devices.remove(syspath)
+    }
+
+    async fn notify_device_added(&self, object_path: OwnedObjectPath) -> eyre::Result<()> {
+        self.interface
+            .signal_emitter()
+            .device_added(object_path)
+            .await?;
+        Ok(())
+    }
+
+    async fn notify_device_removed(&self, object_path: OwnedObjectPath) -> eyre::Result<()> {
+        self.interface
+            .signal_emitter()
+            .device_removed(object_path)
+            .await?;
+        Ok(())
+    }
+}
+
+fn create_object_path(
+    vid: u16,
+    pid: u16,
+    sysname: &OsStr,
+) -> zbus::zvariant::Result<OwnedObjectPath> {
+    let sysname_hex = hex::encode(sysname.as_bytes());
+    let object_path = format!("/dev/hasali/Fang/{vid}_{pid}_{sysname_hex}");
+    OwnedObjectPath::try_from(object_path)
+}
+
+fn interface_name<I: Interface>(_interface: &I) -> InterfaceName<'static> {
+    <I as Interface>::name()
 }
 
 async fn handle_udev_event(
@@ -137,13 +190,29 @@ async fn handle_udev_event(
 
             let paired_device = dock.get_paired_device().await?;
 
-            let device = device_manager
-                .devices
-                .entry(usb_syspath.clone())
-                .or_insert_with(|| Device {
-                    registered_objects: vec![],
+            let object_path =
+                create_object_path(RAZER_VID, RAZER_MOUSE_DOCK_PRO_PID, &event.device.sysname)?;
+
+            let service = RazerDeviceService {
+                name: "Mouse Dock Pro",
+            };
+
+            device_manager.add_object(
+                usb_syspath.clone(),
+                DeviceObject {
+                    path: object_path.clone(),
+                    interfaces: vec![interface_name(&service)],
                     tasks: vec![],
-                });
+                },
+            );
+
+            dbus.object_server()
+                .at(object_path.clone(), service)
+                .await?;
+
+            info!(path = %object_path, "Registered device");
+
+            device_manager.notify_device_added(object_path).await?;
 
             if let Some((status, pid)) = &paired_device {
                 info!(pid, connected = *status == 1, "Discovered paired device");
@@ -152,10 +221,7 @@ async fn handle_udev_event(
                     return Ok(());
                 }
 
-                let sysname_hex = hex::encode(event.device.sysname.as_bytes());
-                let object_name = format!("{RAZER_VID}_{pid}_{sysname_hex}");
-                let object_path =
-                    OwnedObjectPath::try_from(format!("/dev/hasali/Fang/{}", object_name))?;
+                let object_path = create_object_path(RAZER_VID, *pid, &event.device.sysname)?;
 
                 let mouse = Mouse::new(
                     hid_device.clone(),
@@ -185,10 +251,14 @@ async fn handle_udev_event(
 
                 let poller_task = tokio::spawn(run_device_poller(mouse, mouse_interface));
 
-                device.registered_objects.push(object_path.clone());
-
-                device.tasks.push(reader_task.abort_handle());
-                device.tasks.push(poller_task.abort_handle());
+                device_manager.add_object(
+                    usb_syspath.clone(),
+                    DeviceObject {
+                        path: object_path.clone(),
+                        interfaces: vec![<RazerMouseService as Interface>::name()],
+                        tasks: vec![reader_task.abort_handle(), poller_task.abort_handle()],
+                    },
+                );
 
                 dbus.object_server()
                     .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
@@ -199,7 +269,7 @@ async fn handle_udev_event(
             }
         }
         DeviceAction::Remove => {
-            let Some(device) = device_manager.devices.remove(&event.device.syspath) else {
+            let Some(device) = device_manager.remove_device(&event.device.syspath) else {
                 return Ok(());
             };
 
@@ -208,23 +278,20 @@ async fn handle_udev_event(
                 "Device disconnected"
             );
 
-            for path in device.registered_objects {
-                dbus.object_server()
-                    .remove::<RazerMouseService, _>(&path)
-                    .await?;
+            let object_server = dbus.object_server();
 
-                info!(path = %path, "Unregistered device");
+            for object in device.registered_objects {
+                for interface in object.interfaces {
+                    object_server.remove_named(&object.path, interface).await?;
+                }
 
-                dbus.object_server()
-                    .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
-                    .await?
-                    .signal_emitter()
-                    .device_removed(path)
-                    .await?;
-            }
+                info!(path = %object.path, "Unregistered device");
 
-            for task in device.tasks {
-                task.abort();
+                device_manager.notify_device_removed(object.path).await?;
+
+                for task in object.tasks {
+                    task.abort();
+                }
             }
         }
     }
@@ -236,7 +303,7 @@ async fn run_device_poller(mouse: Mouse, mouse_interface: InterfaceRef<RazerMous
     loop {
         tokio::time::sleep(Duration::from_secs(150)).await;
 
-        info!("Polling mouse state");
+        debug!("Polling mouse state");
 
         if let Err(error) = poll_device_state(&mouse, mouse_interface.clone()).await {
             error!(?error, "Failed to poll mouse state");
@@ -381,6 +448,18 @@ impl DeviceManagerService {
     #[zbus(signal)]
     async fn device_removed(emitter: &SignalEmitter<'_>, path: OwnedObjectPath)
     -> zbus::Result<()>;
+}
+
+struct RazerDeviceService {
+    name: &'static str,
+}
+
+#[interface(name = "dev.hasali.Fang.Device")]
+impl RazerDeviceService {
+    #[zbus(property(emits_changed_signal = "const"))]
+    async fn name(&self) -> &'static str {
+        self.name
+    }
 }
 
 struct RazerMouseService {
