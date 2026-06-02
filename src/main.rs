@@ -21,7 +21,7 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 
 use crate::dev::DeviceFile;
-use crate::driver::{AsyncHidDevice, Mouse, MouseDock};
+use crate::driver::{AsyncHidDevice, LightingRegion, Mouse, MouseDock, RazerDevice};
 use crate::udev::{DeviceAction, UsbMonitor};
 
 const RAZER_VID: u16 = 0x1532;
@@ -99,18 +99,18 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
 }
 
 struct DeviceManager {
-    devices: BTreeMap<PathBuf, Device>,
+    devices: BTreeMap<PathBuf, Vec<Device>>,
     interface: InterfaceRef<DeviceManagerService>,
 }
 
 struct Device {
-    registered_objects: Vec<DeviceObject>,
+    objects: Vec<DeviceObject>,
+    tasks: Vec<tokio::task::AbortHandle>,
 }
 
 struct DeviceObject {
     path: OwnedObjectPath,
     interfaces: Vec<InterfaceName<'static>>,
-    tasks: Vec<tokio::task::AbortHandle>,
 }
 
 impl DeviceManager {
@@ -121,18 +121,12 @@ impl DeviceManager {
         }
     }
 
-    fn add_object(&mut self, syspath: PathBuf, object: DeviceObject) {
-        self.devices
-            .entry(syspath)
-            .or_insert_with(|| Device {
-                registered_objects: vec![],
-            })
-            .registered_objects
-            .push(object);
+    fn add_device(&mut self, syspath: PathBuf, device: Device) {
+        self.devices.entry(syspath).or_default().push(device);
     }
 
-    fn remove_device(&mut self, syspath: &Path) -> Option<Device> {
-        self.devices.remove(syspath)
+    fn remove_devices(&mut self, syspath: &Path) -> Vec<Device> {
+        self.devices.remove(syspath).unwrap_or_default()
     }
 
     async fn notify_device_added(&self, object_path: OwnedObjectPath) -> eyre::Result<()> {
@@ -162,7 +156,7 @@ fn create_object_path(
     OwnedObjectPath::try_from(object_path)
 }
 
-fn interface_name<I: Interface>(_interface: &I) -> InterfaceName<'static> {
+fn interface_name<I: Interface>() -> InterfaceName<'static> {
     <I as Interface>::name()
 }
 
@@ -187,24 +181,44 @@ async fn handle_udev_event(
             let hid_device = AsyncHidDevice::create(hid.open_path(&devnode)?);
 
             let dock = MouseDock::new(hid_device.clone());
-
-            let paired_device = dock.get_paired_device().await?;
+            let lighting_regions = dock.clone().into_generic().get_lighting_regions().await?;
 
             let object_path =
                 create_object_path(RAZER_VID, RAZER_MOUSE_DOCK_PRO_PID, &event.device.sysname)?;
 
+            let mut objects = vec![];
+
+            for lighting_region in lighting_regions {
+                let object_path = OwnedObjectPath::try_from(format!(
+                    "{object_path}/light{}",
+                    lighting_region.region_id
+                ))?;
+
+                let device = dock.clone().into_generic();
+                let brightness = device.get_brightness(lighting_region.region_id).await?;
+
+                dbus.object_server()
+                    .at(
+                        object_path.clone(),
+                        LightingRegionInterface {
+                            device: dock.clone().into_generic(),
+                            region: lighting_region,
+                            brightness,
+                        },
+                    )
+                    .await?;
+
+                info!(path = %object_path, "Mounted object");
+
+                objects.push(DeviceObject {
+                    path: object_path,
+                    interfaces: vec![interface_name::<LightingRegionInterface>()],
+                });
+            }
+
             let service = RazerDeviceService {
                 name: "Mouse Dock Pro",
             };
-
-            device_manager.add_object(
-                usb_syspath.clone(),
-                DeviceObject {
-                    path: object_path.clone(),
-                    interfaces: vec![interface_name(&service)],
-                    tasks: vec![],
-                },
-            );
 
             dbus.object_server()
                 .at(object_path.clone(), service)
@@ -212,7 +226,22 @@ async fn handle_udev_event(
 
             info!(path = %object_path, "Registered device");
 
+            objects.push(DeviceObject {
+                path: object_path.clone(),
+                interfaces: vec![interface_name::<RazerDeviceService>()],
+            });
+
+            device_manager.add_device(
+                usb_syspath.clone(),
+                Device {
+                    objects,
+                    tasks: vec![],
+                },
+            );
+
             device_manager.notify_device_added(object_path).await?;
+
+            let paired_device = dock.get_paired_device().await?;
 
             if let Some((status, pid)) = &paired_device {
                 info!(pid, connected = *status == 1, "Discovered paired device");
@@ -251,11 +280,13 @@ async fn handle_udev_event(
 
                 let poller_task = tokio::spawn(run_device_poller(mouse, mouse_interface));
 
-                device_manager.add_object(
+                device_manager.add_device(
                     usb_syspath.clone(),
-                    DeviceObject {
-                        path: object_path.clone(),
-                        interfaces: vec![<RazerMouseService as Interface>::name()],
+                    Device {
+                        objects: vec![DeviceObject {
+                            path: object_path.clone(),
+                            interfaces: vec![interface_name::<RazerMouseService>()],
+                        }],
                         tasks: vec![reader_task.abort_handle(), poller_task.abort_handle()],
                     },
                 );
@@ -269,27 +300,27 @@ async fn handle_udev_event(
             }
         }
         DeviceAction::Remove => {
-            let Some(device) = device_manager.remove_device(&event.device.syspath) else {
-                return Ok(());
-            };
+            let devices = device_manager.remove_devices(&event.device.syspath);
 
-            info!(
-                syspath = %event.device.syspath.display(),
-                "Device disconnected"
-            );
+            for device in devices {
+                info!(
+                    syspath = %event.device.syspath.display(),
+                    "Device disconnected"
+                );
 
-            let object_server = dbus.object_server();
+                let object_server = dbus.object_server();
 
-            for object in device.registered_objects {
-                for interface in object.interfaces {
-                    object_server.remove_named(&object.path, interface).await?;
+                for object in device.objects {
+                    for interface in object.interfaces {
+                        object_server.remove_named(&object.path, interface).await?;
+                    }
+
+                    info!(path = %object.path, "Unregistered device");
+
+                    device_manager.notify_device_removed(object.path).await?;
                 }
 
-                info!(path = %object.path, "Unregistered device");
-
-                device_manager.notify_device_removed(object.path).await?;
-
-                for task in object.tasks {
+                for task in device.tasks {
                     task.abort();
                 }
             }
@@ -505,5 +536,44 @@ impl RazerMouseService {
     #[zbus(property)]
     async fn dpi(&self) -> u16 {
         self.state.dpi
+    }
+}
+
+struct LightingRegionInterface {
+    device: RazerDevice,
+    region: LightingRegion,
+    brightness: u8,
+}
+
+#[interface(name = "dev.hasali.Fang.LightingRegion")]
+impl LightingRegionInterface {
+    #[zbus(property(emits_changed_signal = "const"))]
+    pub fn region_id(&self) -> u8 {
+        self.region.region_id
+    }
+
+    #[zbus(property(emits_changed_signal = "const"))]
+    pub fn matrix_x(&self) -> u8 {
+        self.region.matrix_x
+    }
+
+    #[zbus(property(emits_changed_signal = "const"))]
+    pub fn matrix_y(&self) -> u8 {
+        self.region.matrix_y
+    }
+
+    #[zbus(property)]
+    pub fn brightness(&self) -> u8 {
+        self.brightness
+    }
+
+    #[zbus(property)]
+    pub async fn set_brightness(&mut self, value: u8) -> zbus::fdo::Result<()> {
+        self.device
+            .set_brightness(self.region.region_id, value)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.brightness = value;
+        Ok(())
     }
 }

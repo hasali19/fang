@@ -7,6 +7,77 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{trace, warn};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+pub struct RazerDevice {
+    device: AsyncHidDevice,
+    base_transaction_id: u8,
+}
+
+pub struct LightingRegion {
+    pub region_id: u8,
+    pub matrix_x: u8,
+    pub matrix_y: u8,
+}
+
+impl RazerDevice {
+    pub async fn get_lighting_regions(&self) -> eyre::Result<Vec<LightingRegion>> {
+        let r = self
+            .device
+            .request(Request::new(
+                self.base_transaction_id,
+                0x0f,
+                0x80 | 0x00,
+                80,
+            ))
+            .await?;
+
+        let region_count = r.data_len / 5;
+        let mut regions = Vec::with_capacity(region_count as usize);
+
+        for i in 0..region_count as usize {
+            let region_id = r.data[i * 5 + 0];
+            // What are these?
+            // let _ = r.data[i * 5 + 1];
+            // let _ = r.data[i * 5 + 2];
+            let matrix_x = r.data[i * 5 + 3];
+            let matrix_y = r.data[i * 5 + 4];
+            regions.push(LightingRegion {
+                region_id,
+                matrix_x,
+                matrix_y,
+            });
+        }
+
+        Ok(regions)
+    }
+
+    pub async fn get_brightness(&self, region_id: u8) -> eyre::Result<u8> {
+        let r = self
+            .device
+            .request(
+                Request::new(self.base_transaction_id, 0x0f, 0x80 | 0x04, 3)
+                    .with_data(&[0x01, region_id]),
+            )
+            .await?;
+
+        Ok(r.data[2])
+    }
+
+    pub async fn set_brightness(&self, region_type: u8, value: u8) -> eyre::Result<()> {
+        self.device
+            .request(
+                Request::new(self.base_transaction_id, 0x0f, 0x00 | 0x04, 3).with_data(&[
+                    0x01,
+                    region_type,
+                    value,
+                ]),
+            )
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct MouseDock {
     device: AsyncHidDevice,
     base_transaction_id: u8,
@@ -17,6 +88,13 @@ impl MouseDock {
         MouseDock {
             device: device,
             base_transaction_id: 0xe0,
+        }
+    }
+
+    pub fn into_generic(self) -> RazerDevice {
+        RazerDevice {
+            device: self.device,
+            base_transaction_id: self.base_transaction_id,
         }
     }
 
