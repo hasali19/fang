@@ -1,3 +1,5 @@
+pub mod chroma;
+
 use std::thread;
 use std::time::Duration;
 
@@ -7,106 +9,41 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{trace, warn};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+#[derive(Clone)]
 pub struct RazerDevice {
     device: AsyncHidDevice,
     base_transaction_id: u8,
 }
 
-pub struct LightingRegion {
-    pub region_id: u8,
-    pub matrix_x: u8,
-    pub matrix_y: u8,
-}
-
 impl RazerDevice {
-    pub async fn get_lighting_regions(&self) -> eyre::Result<Vec<LightingRegion>> {
-        let r = self
-            .device
-            .request(Request::new(
-                self.base_transaction_id,
-                0x0f,
-                0x80 | 0x00,
-                80,
-            ))
-            .await?;
-
-        let region_count = r.data_len / 5;
-        let mut regions = Vec::with_capacity(region_count as usize);
-
-        for i in 0..region_count as usize {
-            let region_id = r.data[i * 5 + 0];
-            // What are these?
-            // let _ = r.data[i * 5 + 1];
-            // let _ = r.data[i * 5 + 2];
-            let matrix_x = r.data[i * 5 + 3];
-            let matrix_y = r.data[i * 5 + 4];
-            regions.push(LightingRegion {
-                region_id,
-                matrix_x,
-                matrix_y,
-            });
-        }
-
-        Ok(regions)
-    }
-
-    pub async fn get_brightness(&self, region_id: u8) -> eyre::Result<u8> {
-        let r = self
-            .device
-            .request(
-                Request::new(self.base_transaction_id, 0x0f, 0x80 | 0x04, 3)
-                    .with_data(&[0x01, region_id]),
-            )
-            .await?;
-
-        Ok(r.data[2])
-    }
-
-    pub async fn set_brightness(&self, region_type: u8, value: u8) -> eyre::Result<()> {
-        self.device
-            .request(
-                Request::new(self.base_transaction_id, 0x0f, 0x00 | 0x04, 3).with_data(&[
-                    0x01,
-                    region_type,
-                    value,
-                ]),
-            )
-            .await?;
-
-        Ok(())
+    async fn request(&self, request: Request) -> eyre::Result<Report> {
+        self.device.request(request, self.base_transaction_id).await
     }
 }
 
 #[derive(Clone)]
 pub struct MouseDock {
-    device: AsyncHidDevice,
-    base_transaction_id: u8,
+    device: RazerDevice,
 }
 
 impl MouseDock {
     pub fn new(device: AsyncHidDevice) -> MouseDock {
         MouseDock {
-            device: device,
-            base_transaction_id: 0xe0,
+            device: RazerDevice {
+                device,
+                base_transaction_id: 0xe0,
+            },
         }
     }
 
     pub fn into_generic(self) -> RazerDevice {
-        RazerDevice {
-            device: self.device,
-            base_transaction_id: self.base_transaction_id,
-        }
+        self.device
     }
 
     pub async fn get_paired_device(&self) -> eyre::Result<Option<(u8, u16)>> {
         let r = self
             .device
-            .request(Request::new(
-                self.base_transaction_id,
-                0x00,
-                0x80 | 0x3f,
-                80,
-            ))
+            .request(Request::new(0x00, 0x80 | 0x3f, 80))
             .await?;
 
         let status = r.data[1];
@@ -121,22 +58,23 @@ impl MouseDock {
 
 #[derive(Clone)]
 pub struct Mouse {
-    device: AsyncHidDevice,
-    base_transaction_id: u8,
+    device: RazerDevice,
 }
 
 impl Mouse {
     pub fn new(device: AsyncHidDevice, base_transaction_id: u8) -> Mouse {
         Mouse {
-            device,
-            base_transaction_id,
+            device: RazerDevice {
+                device,
+                base_transaction_id,
+            },
         }
     }
 
     pub async fn get_battery_level(&self) -> eyre::Result<u8> {
         let r = self
             .device
-            .request(Request::new(self.base_transaction_id, 0x07, 0x80 | 0x00, 2))
+            .request(Request::new(0x07, 0x80 | 0x00, 2))
             .await?;
 
         Ok((f64::from(r.data[1] as f64 / 255.0) * 100.0) as u8)
@@ -145,7 +83,7 @@ impl Mouse {
     pub async fn get_charging_status(&self) -> eyre::Result<u8> {
         let r = self
             .device
-            .request(Request::new(self.base_transaction_id, 0x07, 0x80 | 0x04, 2))
+            .request(Request::new(0x07, 0x80 | 0x04, 2))
             .await?;
 
         Ok(r.data[1])
@@ -154,30 +92,41 @@ impl Mouse {
     pub async fn get_dpi(&self) -> eyre::Result<u16> {
         let r = self
             .device
-            .request(Request::new(self.base_transaction_id, 0x04, 0x80 | 0x05, 7))
+            .request(Request::new(0x04, 0x80 | 0x05, 7))
             .await?;
 
         Ok(u16::from_be_bytes([r.data[1], r.data[2]]))
     }
 }
 
+struct RequestTask {
+    request: Request,
+    base_transaction_id: u8,
+    reply_sender: oneshot::Sender<eyre::Result<Report>>,
+    span: tracing::Span,
+}
+
 #[derive(Clone)]
 pub struct AsyncHidDevice {
-    sender: mpsc::Sender<(Request, oneshot::Sender<eyre::Result<Report>>)>,
+    sender: mpsc::Sender<RequestTask>,
 }
 
 impl AsyncHidDevice {
     pub fn create(device: HidDevice) -> AsyncHidDevice {
-        let (sender, mut receiver) =
-            mpsc::channel::<(Request, oneshot::Sender<eyre::Result<Report>>)>(8);
+        let (sender, mut receiver) = mpsc::channel::<RequestTask>(8);
 
         thread::spawn(move || {
             let mut transaction_id = 0;
 
-            while let Some((task, reply_sender)) = receiver.blocking_recv() {
-                let _ = match Self::process_task(&device, task, transaction_id) {
-                    Ok(res) => reply_sender.send(Ok(res)),
-                    Err(error) => reply_sender.send(Err(error)),
+            while let Some(task) = receiver.blocking_recv() {
+                let _guard = task.span.enter();
+                let _ = match Self::process_task(
+                    &device,
+                    task.request,
+                    task.base_transaction_id | transaction_id,
+                ) {
+                    Ok(res) => task.reply_sender.send(Ok(res)),
+                    Err(error) => task.reply_sender.send(Err(error)),
                 };
                 transaction_id = (transaction_id + 1) % 31;
             }
@@ -195,7 +144,7 @@ impl AsyncHidDevice {
             let mut req_report = Report {
                 report_id: 0,
                 status: 0,
-                transaction_id: request.base_transaction_id | transaction_id,
+                transaction_id,
                 _reserved1: [0; _],
                 data_len: request.data_len,
                 command_class: request.command_class,
@@ -245,9 +194,16 @@ impl AsyncHidDevice {
         }
     }
 
-    async fn request(&self, request: Request) -> eyre::Result<Report> {
+    async fn request(&self, request: Request, base_transaction_id: u8) -> eyre::Result<Report> {
         let (reply_sender, reply_receiver) = oneshot::channel();
-        self.sender.send((request, reply_sender)).await?;
+        self.sender
+            .send(RequestTask {
+                request,
+                base_transaction_id,
+                reply_sender,
+                span: tracing::Span::current(),
+            })
+            .await?;
         reply_receiver.await?
     }
 }
@@ -268,7 +224,6 @@ struct Report {
 }
 
 struct Request {
-    base_transaction_id: u8,
     data_len: u8,
     command_class: u8,
     command_id: u8,
@@ -276,9 +231,8 @@ struct Request {
 }
 
 impl Request {
-    fn new(base_transaction_id: u8, command_class: u8, command_id: u8, data_len: u8) -> Request {
+    fn new(command_class: u8, command_id: u8, data_len: u8) -> Request {
         Request {
-            base_transaction_id,
             data_len,
             command_class,
             command_id,

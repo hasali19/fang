@@ -21,7 +21,8 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 
 use crate::dev::DeviceFile;
-use crate::driver::{AsyncHidDevice, LightingRegion, Mouse, MouseDock, RazerDevice};
+use crate::driver::chroma::LightingRegion;
+use crate::driver::{AsyncHidDevice, Mouse, MouseDock, RazerDevice};
 use crate::udev::{DeviceAction, UsbMonitor};
 
 const RAZER_VID: u16 = 0x1532;
@@ -181,7 +182,8 @@ async fn handle_udev_event(
             let hid_device = AsyncHidDevice::create(hid.open_path(&devnode)?);
 
             let dock = MouseDock::new(hid_device.clone());
-            let lighting_regions = dock.clone().into_generic().get_lighting_regions().await?;
+            let lighting_regions =
+                driver::chroma::get_lighting_regions(&dock.clone().into_generic()).await?;
 
             let object_path =
                 create_object_path(RAZER_VID, RAZER_MOUSE_DOCK_PRO_PID, &event.device.sysname)?;
@@ -195,7 +197,14 @@ async fn handle_udev_event(
                 ))?;
 
                 let device = dock.clone().into_generic();
-                let brightness = device.get_brightness(lighting_region.region_id).await?;
+                let brightness =
+                    driver::chroma::get_brightness(&device, lighting_region.region_id).await?;
+
+                let effects =
+                    driver::chroma::get_available_effects(&device, lighting_region.region_id)
+                        .await?;
+
+                let effect = driver::chroma::get_effect(&device, lighting_region.region_id).await?;
 
                 dbus.object_server()
                     .at(
@@ -204,6 +213,8 @@ async fn handle_udev_event(
                             device: dock.clone().into_generic(),
                             region: lighting_region,
                             brightness,
+                            effects,
+                            effect,
                         },
                     )
                     .await?;
@@ -543,6 +554,8 @@ struct LightingRegionInterface {
     device: RazerDevice,
     region: LightingRegion,
     brightness: u8,
+    effects: Vec<u8>,
+    effect: u8,
 }
 
 #[interface(name = "dev.hasali.Fang.LightingRegion")]
@@ -562,6 +575,11 @@ impl LightingRegionInterface {
         self.region.matrix_y
     }
 
+    #[zbus(property(emits_changed_signal = "const"))]
+    pub fn effects(&self) -> &[u8] {
+        &self.effects
+    }
+
     #[zbus(property)]
     pub fn brightness(&self) -> u8 {
         self.brightness
@@ -569,11 +587,26 @@ impl LightingRegionInterface {
 
     #[zbus(property)]
     pub async fn set_brightness(&mut self, value: u8) -> zbus::fdo::Result<()> {
-        self.device
-            .set_brightness(self.region.region_id, value)
+        driver::chroma::set_brightness(&self.device, self.region.region_id, value)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
         self.brightness = value;
+
+        Ok(())
+    }
+
+    #[zbus(property)]
+    pub fn effect(&self) -> u8 {
+        self.effect
+    }
+
+    #[zbus(property)]
+    pub async fn set_effect(&mut self, value: u8) -> zbus::fdo::Result<()> {
+        driver::chroma::set_effect(&self.device, self.region.region_id, value)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
         Ok(())
     }
 }
