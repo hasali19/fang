@@ -1508,7 +1508,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "5.16.0"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "async-broadcast",
  "async-executor",
@@ -1542,7 +1542,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "5.16.0"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1556,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "zbus_names"
 version = "4.3.2"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "serde",
  "winnow",
@@ -1592,7 +1592,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 [[package]]
 name = "zvariant"
 version = "5.12.0"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "endi",
  "enumflags2",
@@ -1605,7 +1605,7 @@ dependencies = [
 [[package]]
 name = "zvariant_derive"
 version = "5.12.0"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1617,7 +1617,7 @@ dependencies = [
 [[package]]
 name = "zvariant_utils"
 version = "3.4.0"
-source = "git+https://github.com/hasali19/zbus#549c0b996c2bc55c81385d6055eba2f0ec24714c"
+source = "git+https://github.com/z-galaxy/zbus#9647d3b4e0dfe24e3536d12b81e33537f831c3c9"
 dependencies = [
  "proc-macro2",
  "quote",
