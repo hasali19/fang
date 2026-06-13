@@ -8,15 +8,17 @@ use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::ensure;
 use hidapi::HidApi;
+use parking_lot::Mutex;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::names::InterfaceName;
-use zbus::object_server::{Interface, InterfaceRef, SignalEmitter};
+use zbus::object_server::{Interface, InterfaceRef};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{connection, interface};
 
@@ -49,10 +51,17 @@ async fn main() -> eyre::Result<()> {
         connection::Builder::system()?
     };
 
+    let device_manager = Arc::new(DeviceManager::new());
+
     let dbus_name = "dev.hasali.Fang";
     let dbus = builder
         .name(dbus_name)?
-        .serve_at("/dev/hasali/Fang", DeviceManagerService)?
+        .serve_at(
+            "/dev/hasali/Fang",
+            DeviceManagerService {
+                device_manager: device_manager.clone(),
+            },
+        )?
         .build()
         .await?;
 
@@ -61,16 +70,18 @@ async fn main() -> eyre::Result<()> {
         if use_session_bus { "session" } else { "system" }
     );
 
-    tokio::task::spawn_local(run_device_monitor(dbus));
+    tokio::task::spawn_local(run_device_monitor(dbus, device_manager));
 
     tokio::signal::ctrl_c().await?;
 
     Ok(())
 }
 
-async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
+async fn run_device_monitor(
+    dbus: zbus::Connection,
+    device_manager: Arc<DeviceManager>,
+) -> eyre::Result<()> {
     let device_manager_interface = dbus.object_server().interface("/dev/hasali/Fang").await?;
-    let mut device_manager = DeviceManager::new(device_manager_interface);
 
     let hid = HidApi::new()?;
     let monitor = UsbMonitor::new(RAZER_VID)?
@@ -91,7 +102,15 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
             }
         };
 
-        if let Err(error) = handle_udev_event(&hid, &mut device_manager, &dbus, event).await {
+        if let Err(error) = handle_udev_event(
+            &hid,
+            &device_manager,
+            &device_manager_interface,
+            &dbus,
+            event,
+        )
+        .await
+        {
             error!(?error, "Failed to handle udev event");
         }
     }
@@ -100,8 +119,7 @@ async fn run_device_monitor(dbus: zbus::Connection) -> eyre::Result<()> {
 }
 
 struct DeviceManager {
-    devices: BTreeMap<PathBuf, Vec<Device>>,
-    interface: InterfaceRef<DeviceManagerService>,
+    devices: Mutex<BTreeMap<PathBuf, Vec<Device>>>,
 }
 
 struct Device {
@@ -115,35 +133,18 @@ struct DeviceObject {
 }
 
 impl DeviceManager {
-    fn new(interface: InterfaceRef<DeviceManagerService>) -> DeviceManager {
+    fn new() -> DeviceManager {
         DeviceManager {
-            devices: BTreeMap::default(),
-            interface,
+            devices: Mutex::new(BTreeMap::default()),
         }
     }
 
-    fn add_device(&mut self, syspath: PathBuf, device: Device) {
-        self.devices.entry(syspath).or_default().push(device);
+    fn add_device(&self, syspath: PathBuf, device: Device) {
+        self.devices.lock().entry(syspath).or_default().push(device);
     }
 
-    fn remove_devices(&mut self, syspath: &Path) -> Vec<Device> {
-        self.devices.remove(syspath).unwrap_or_default()
-    }
-
-    async fn notify_device_added(&self, object_path: OwnedObjectPath) -> eyre::Result<()> {
-        self.interface
-            .signal_emitter()
-            .device_added(object_path)
-            .await?;
-        Ok(())
-    }
-
-    async fn notify_device_removed(&self, object_path: OwnedObjectPath) -> eyre::Result<()> {
-        self.interface
-            .signal_emitter()
-            .device_removed(object_path)
-            .await?;
-        Ok(())
+    fn remove_devices(&self, syspath: &Path) -> Vec<Device> {
+        self.devices.lock().remove(syspath).unwrap_or_default()
     }
 }
 
@@ -163,7 +164,8 @@ fn interface_name<I: Interface>() -> InterfaceName<'static> {
 
 async fn handle_udev_event(
     hid: &HidApi,
-    device_manager: &mut DeviceManager,
+    device_manager: &DeviceManager,
+    device_manager_interface: &InterfaceRef<DeviceManagerService>,
     dbus: &zbus::Connection,
     event: udev::UsbDeviceEvent,
 ) -> eyre::Result<()> {
@@ -254,7 +256,11 @@ async fn handle_udev_event(
                 },
             );
 
-            device_manager.notify_device_added(object_path).await?;
+            device_manager_interface
+                .get()
+                .await
+                .devices_changed(device_manager_interface.signal_emitter())
+                .await?;
 
             let paired_device = dock.get_paired_device().await?;
 
@@ -317,11 +323,10 @@ async fn handle_udev_event(
                     },
                 );
 
-                dbus.object_server()
-                    .interface::<_, DeviceManagerService>("/dev/hasali/Fang")
-                    .await?
-                    .signal_emitter()
-                    .device_added(object_path)
+                device_manager_interface
+                    .get()
+                    .await
+                    .devices_changed(device_manager_interface.signal_emitter())
                     .await?;
             }
         }
@@ -343,7 +348,11 @@ async fn handle_udev_event(
 
                     info!(path = %object.path, "Unregistered device");
 
-                    device_manager.notify_device_removed(object.path).await?;
+                    device_manager_interface
+                        .get()
+                        .await
+                        .devices_changed(device_manager_interface.signal_emitter())
+                        .await?;
                 }
 
                 for task in device.tasks {
@@ -495,16 +504,32 @@ async fn read_mouse_state(mouse: &Mouse) -> eyre::Result<MouseState> {
     })
 }
 
-struct DeviceManagerService;
+struct DeviceManagerService {
+    device_manager: Arc<DeviceManager>,
+}
 
 #[interface(name = "dev.hasali.Fang.DeviceManager")]
 impl DeviceManagerService {
-    #[zbus(signal)]
-    async fn device_added(emitter: &SignalEmitter<'_>, path: OwnedObjectPath) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn device_removed(emitter: &SignalEmitter<'_>, path: OwnedObjectPath)
-    -> zbus::Result<()>;
+    #[zbus(property)]
+    fn devices(&self) -> Vec<OwnedObjectPath> {
+        self.device_manager
+            .devices
+            .lock()
+            .values()
+            .flatten()
+            .flat_map(|device| {
+                device.objects.iter().filter(|object| {
+                    [
+                        interface_name::<RazerDeviceService>(),
+                        interface_name::<RazerMouseService>(),
+                    ]
+                    .iter()
+                    .any(|interface| object.interfaces.contains(interface))
+                })
+            })
+            .map(|object| object.path.clone())
+            .collect()
+    }
 }
 
 struct RazerDeviceService {
@@ -515,7 +540,7 @@ struct RazerDeviceService {
 #[interface(name = "dev.hasali.Fang.Device")]
 impl RazerDeviceService {
     #[zbus(property(emits_changed_signal = "const"))]
-    async fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         self.name
     }
 
