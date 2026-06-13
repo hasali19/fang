@@ -189,6 +189,7 @@ async fn handle_udev_event(
                 create_object_path(RAZER_VID, RAZER_MOUSE_DOCK_PRO_PID, &event.device.sysname)?;
 
             let mut objects = vec![];
+            let mut lighting_region_paths = vec![];
 
             for lighting_region in lighting_regions {
                 let object_path = OwnedObjectPath::try_from(format!(
@@ -221,6 +222,8 @@ async fn handle_udev_event(
 
                 info!(path = %object_path, "Mounted object");
 
+                lighting_region_paths.push(object_path.clone());
+
                 objects.push(DeviceObject {
                     path: object_path,
                     interfaces: vec![interface_name::<LightingRegionInterface>()],
@@ -229,6 +232,7 @@ async fn handle_udev_event(
 
             let service = RazerDeviceService {
                 name: "Mouse Dock Pro",
+                lighting_regions: lighting_region_paths,
             };
 
             dbus.object_server()
@@ -494,6 +498,7 @@ impl DeviceManagerService {
 
 struct RazerDeviceService {
     name: &'static str,
+    lighting_regions: Vec<OwnedObjectPath>,
 }
 
 #[interface(name = "dev.hasali.Fang.Device")]
@@ -501,6 +506,11 @@ impl RazerDeviceService {
     #[zbus(property(emits_changed_signal = "const"))]
     async fn name(&self) -> &'static str {
         self.name
+    }
+
+    #[zbus(property(emits_changed_signal = "const"))]
+    fn lighting_regions(&self) -> &[OwnedObjectPath] {
+        &self.lighting_regions
     }
 }
 
