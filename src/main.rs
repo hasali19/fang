@@ -19,7 +19,7 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::names::InterfaceName;
 use zbus::object_server::{Interface, InterfaceRef};
-use zbus::zvariant::OwnedObjectPath;
+use zbus::zvariant::{OwnedObjectPath, Type, Value};
 use zbus::{connection, interface};
 
 use crate::dev::DeviceFile;
@@ -234,6 +234,7 @@ async fn handle_udev_event(
 
             let service = RazerDeviceService {
                 name: "Mouse Dock Pro",
+                device_type: DeviceType::Dock,
                 lighting_regions: lighting_region_paths,
             };
 
@@ -289,6 +290,7 @@ async fn handle_udev_event(
                         object_path.clone(),
                         RazerDeviceService {
                             name: "Basilisk V3 Pro 35K",
+                            device_type: DeviceType::Mouse,
                             // TODO
                             lighting_regions: vec![],
                         },
@@ -532,8 +534,15 @@ impl DeviceManagerService {
     }
 }
 
+#[derive(Copy, Clone, Type, Value)]
+enum DeviceType {
+    Dock = 1,
+    Mouse = 2,
+}
+
 struct RazerDeviceService {
     name: &'static str,
+    device_type: DeviceType,
     lighting_regions: Vec<OwnedObjectPath>,
 }
 
@@ -542,6 +551,11 @@ impl RazerDeviceService {
     #[zbus(property(emits_changed_signal = "const"))]
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    #[zbus(property(emits_changed_signal = "const"))]
+    fn device_type(&self) -> DeviceType {
+        self.device_type
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
