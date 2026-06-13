@@ -42,7 +42,7 @@ pub async fn get_available_effects(device: &RazerDevice, region_id: u8) -> eyre:
 #[tracing::instrument(skip(device))]
 pub async fn get_effect(device: &RazerDevice, region_id: u8) -> eyre::Result<u8> {
     let res = device
-        .request(Request::new(0x0f, 0x80 | 0x02, 80).with_data(&[0x01, region_id]))
+        .request(Request::new(0x0f, 0x80 | 0x02, 80).with_data(&[0x00, region_id]))
         .await?;
 
     Ok(res.data[2])
@@ -51,7 +51,7 @@ pub async fn get_effect(device: &RazerDevice, region_id: u8) -> eyre::Result<u8>
 #[tracing::instrument(skip(device))]
 pub async fn set_effect(device: &RazerDevice, region_id: u8, effect: u8) -> eyre::Result<u8> {
     let res = device
-        .request(Request::new(0x0f, 0x00 | 0x02, 80).with_data(&[0x01, region_id, effect]))
+        .request(Request::new(0x0f, 0x00 | 0x02, 80).with_data(&[0x00, region_id, effect]))
         .await?;
 
     Ok(res.data[2])
@@ -60,7 +60,7 @@ pub async fn set_effect(device: &RazerDevice, region_id: u8, effect: u8) -> eyre
 #[tracing::instrument(skip(device))]
 pub async fn get_brightness(device: &RazerDevice, region_id: u8) -> eyre::Result<u8> {
     let res = device
-        .request(Request::new(0x0f, 0x80 | 0x04, 3).with_data(&[0x01, region_id]))
+        .request(Request::new(0x0f, 0x80 | 0x04, 3).with_data(&[0x00, region_id]))
         .await?;
 
     Ok(res.data[2])
@@ -69,7 +69,7 @@ pub async fn get_brightness(device: &RazerDevice, region_id: u8) -> eyre::Result
 #[tracing::instrument(skip(device))]
 pub async fn set_brightness(device: &RazerDevice, region_id: u8, value: u8) -> eyre::Result<()> {
     device
-        .request(Request::new(0x0f, 0x00 | 0x04, 3).with_data(&[0x01, region_id, value]))
+        .request(Request::new(0x0f, 0x00 | 0x04, 3).with_data(&[0x00, region_id, value]))
         .await?;
 
     Ok(())
