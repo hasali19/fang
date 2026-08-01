@@ -1,4 +1,5 @@
-use crate::driver::{RazerDevice, Request};
+use crate::driver::devices::RazerDevice;
+use crate::driver::protocol::Request;
 
 pub struct LightingRegion {
     pub region_id: u8,
