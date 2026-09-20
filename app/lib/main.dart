@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:forui/forui.dart';
 
 import 'device_client.dart';
+import 'theme/theme.dart';
 
 void main() {
   runApp(const FangApp());
@@ -18,8 +19,14 @@ class FangApp extends StatelessWidget {
         settings: settings,
         pageBuilder: (context, _, _) => builder(context),
       ),
-      builder: (context, child) =>
-          FTheme(data: FTheme.neutral.dark.desktop, child: child!),
+      builder: (context, child) {
+        final brightness = MediaQuery.of(context).platformBrightness;
+        final theme = switch (brightness) {
+          Brightness.dark => darkTheme,
+          Brightness.light => lightTheme,
+        };
+        return FTheme(data: theme, child: child!);
+      },
       home: const HomePage(),
     );
   }
@@ -51,6 +58,7 @@ class _HomePageState extends State<HomePage> {
         builder: (context, snapshot) {
           final devices = snapshot.data;
           return FSidebar(
+            header: SizedBox(height: 16),
             children: [
               FSidebarGroup(
                 label: const Text('Devices'),
